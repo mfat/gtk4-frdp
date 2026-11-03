@@ -16,6 +16,12 @@ gnome = import('gnome')
 pkg = import('pkgconfig')
 
 cc = meson.get_compiler('c')
+
+# WinPR's platform.h includes C11 <threads.h> unless __STDC_NO_THREADS__ is
+# set. MinGW (MSYS2) has neither the header nor the macro, so tell it.
+if not cc.has_header('threads.h')
+  add_project_arguments('-D__STDC_NO_THREADS__=1', language: 'c')
+endif
 add_project_arguments(
   cc.get_supported_arguments([
     '-Wno-unused-parameter',
