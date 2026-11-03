@@ -750,7 +750,7 @@ frdp_session_snapshot (FrdpSession *self,
 
 /* Worker. frame_lock is held from BeginPaint to EndPaint so the main thread
  * never copies a half-painted frame. */
-static gboolean
+static BOOL
 frdp_begin_paint (rdpContext *context)
 {
   FrdpSessionPrivate *priv = ((frdpContext *) context)->self->priv;
@@ -767,7 +767,7 @@ frdp_begin_paint (rdpContext *context)
   return TRUE;
 }
 
-static gboolean
+static BOOL
 frdp_end_paint (rdpContext *context)
 {
   FrdpSession        *self = ((frdpContext *) context)->self;
@@ -790,7 +790,7 @@ frdp_end_paint (rdpContext *context)
 }
 
 /* Worker. */
-static gboolean
+static BOOL
 frdp_desktop_resize (rdpContext *context)
 {
   FrdpSession        *self = ((frdpContext *) context)->self;
@@ -1096,7 +1096,7 @@ frdp_on_channel_disconnected_event_handler (void                                
   }
 }
 
-static gboolean
+static BOOL
 frdp_load_channels (freerdp *instance)
 {
   if (!freerdp_client_load_addins (instance->context->channels, instance->context->settings))
@@ -1105,7 +1105,7 @@ frdp_load_channels (freerdp *instance)
   return TRUE;
 }
 
-static gboolean
+static BOOL
 frdp_pre_connect (freerdp *freerdp_session)
 {
   rdpSettings *settings = freerdp_session->context->settings;
@@ -1148,7 +1148,7 @@ frdp_pre_connect (freerdp *freerdp_session)
 }
 
 /* Worker. */
-static gboolean
+static BOOL
 frdp_post_connect (freerdp *freerdp_session)
 {
   rdpContext         *context = freerdp_session->context;
