@@ -14,8 +14,31 @@ described below is internal.
 - **FrdpSession** (private) — owns the FreeRDP instance and the session
   thread for one connection at a time.
 - **Channel objects** (private) — wrappers for dynamic channels, currently
-  Display Control (resolution changes). (The clipboard channel is not yet
-  ported to GTK 4.)
+  Display Control (resolution changes) and the clipboard.
+
+## Clipboard
+
+FreeRDP's clipboard callbacks copy what they receive and queue it to the
+main thread; everything else — GTK clipboard calls and every message to the
+server — happens there, with a lock guarding the channel against teardown
+by the session thread.
+
+- **Server to local:** when the server announces formats, a
+  `GdkContentProvider` offering the matching MIME types becomes the local
+  clipboard content. Data is only requested from the server when something
+  pastes. Requests go one at a time (responses carry no request id) and
+  time out after 10 s.
+- **Local to server:** a change of the local clipboard's formats is
+  announced to the server; when the server asks for data, the local
+  clipboard is read asynchronously and the answer sent. The widget's own
+  provider is not re-announced.
+- **Conversion:** text and HTML through WinPR's `wClipboard`; images through
+  `frdp-dib.c` (CF_DIB ↔ `GdkTexture` ↔ PNG/BMP), because WinPR's image
+  support depends on its build — Ubuntu's FreeRDP 3.32 has no PNG.
+- When the session ends, server data is withdrawn from the clipboard.
+
+`live-clipboard` checks text (Unicode, edited remotely and copied back) and
+an image round trip through Paint.
 
 ## The session thread
 
@@ -101,6 +124,10 @@ glibc the library calls `malloc_trim(0)` after each session ends.
 - `live-session` (suite `live`) — skipped unless `GTK4_FRDP_TEST_HOST` is
   set; connects to a real server several times and fails on a missed
   connection, a widget that is not freed, or a UI stall over 250 ms.
+- `live-clipboard` (suite `live`) — also needs `xdotool`; text and image
+  clipboard in both directions against Windows (Notepad and Paint).
+- `keyboard-layout`, `dib` — unit tests for layout mapping/detection and
+  the bitmap conversion.
 - `live-cursor` (suite `live`) — also needs `xdotool`; checks that the
   remote cursor is scaled together with the desktop.
 
@@ -111,8 +138,7 @@ All tests need a display; run them with `xvfb-run -a meson test`.
 
 ## Known gaps
 
-- No clipboard yet: the GTK 3 clipboard channel from gtk-frdp is kept in
-  the tree but not built; it needs porting to `GdkClipboard` and the
-  session thread.
+- Clipboard file transfer is not supported; HTML has not been tested
+  against Windows applications.
 - macOS and Windows builds are written for (key codes, event handles) but
   not yet tested.

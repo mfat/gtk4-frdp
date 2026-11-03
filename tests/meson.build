@@ -25,6 +25,12 @@ test_keyboard_layout = executable('test-keyboard-layout',
 )
 test('keyboard-layout', test_keyboard_layout)
 
+test_dib = executable('test-dib', 'test-dib.c', '../src/frdp-dib.c',
+  include_directories: include_directories('../src'),
+  dependencies: [ dependency('gtk4') ],
+)
+test('dib', test_dib)
+
 python = find_program('python3', required: false)
 if get_option('introspection') and python.found()
   test('widget', python,
@@ -35,6 +41,14 @@ if get_option('introspection') and python.found()
   )
   test('live-session', python,
     args: [ files('live-session.py') ],
+    env: test_env,
+    depends: gtk4_frdp_gir,
+    timeout: 120,
+    suite: 'live',
+    is_parallel: false,  # one server account: concurrent logins evict each other
+  )
+  test('live-clipboard', python,
+    args: [ files('live-clipboard.py') ],
     env: test_env,
     depends: gtk4_frdp_gir,
     timeout: 120,

@@ -13,6 +13,7 @@ dynamic resolution, and certificate and login prompts.
   `GdkMemoryTexture`, Wayland and X11.
 - **Full FreeRDP:** NLA/TLS, the graphics pipeline, Display Control
   (the server follows the widget size), and FreeRDP's certificate store.
+- **Clipboard** in both directions: text (Unicode), images, HTML.
 - **Bindings for free:** GObject Introspection namespace `GtkFrdp-4.0`.
 
 gtk4-frdp is derived from GNOME's GTK 3 library
@@ -147,8 +148,9 @@ xvfb-run -a meson test -C _build --suite live
 
 ## Known gaps
 
-- No clipboard yet: gtk-frdp's GTK 3 clipboard channel
-  (`src/frdp-channel-clipboard.c`) still needs porting to GTK 4.
+- Clipboard: text and images work in both directions; HTML is implemented
+  but not yet tested against Windows applications; copying files is not
+  supported.
 - macOS and Windows: code paths exist, builds are untested.
 
 ## License

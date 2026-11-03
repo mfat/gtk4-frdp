@@ -21,7 +21,8 @@ Upstream copyright holders (notices kept in each file):
 Changes since upstream (Copyright (C) 2026 mFat):
   - GTK 4 port of FrdpDisplay and FrdpSession (event controllers,
     snapshot()/GdkMemoryTexture rendering, GTK 4 cursors and shortcut
-    inhibition); FreeRDP 3 only; clipboard channel not yet ported.
+    inhibition); FreeRDP 3 only.
+  - New GTK 4 clipboard channel replacing gtk-frdp's GTK 3/FUSE one.
   - Per-session worker thread owning FreeRDP; prompts answered without a
     nested main loop; non-blocking close.
   - Public API limited to FrdpDisplay; write-only password property.

@@ -74,9 +74,7 @@
 #include "frdp-context.h"
 #include "frdp-channel-display-control.h"
 #include "frdp-keyboard-layout.h"
-#ifdef FRDP_WITH_CLIPBOARD
 #include "frdp-channel-clipboard.h"
-#endif
 
 /* The worker re-checks shall-disconnect at least this often. */
 #define FRDP_WORKER_WAIT_MS 100
@@ -162,9 +160,7 @@ struct _FrdpSessionPrivate
   gboolean      cursor_null;
   gint          cursor_scheduled;   /* atomic */
   FrdpChannelDisplayControl *display_control_channel;
-#ifdef FRDP_WITH_CLIPBOARD
   FrdpChannelClipboard      *clipboard_channel;
-#endif
 
   /* ---- prompts: prompt_lock ---- */
   GMutex        prompt_lock;
@@ -1050,15 +1046,12 @@ frdp_on_channel_connected_event_handler (void                                   
   } else if (strcmp (e->name, RAIL_SVC_CHANNEL_NAME) == 0) {
     // TODO Remote application
   } else if (strcmp (e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
-#ifdef FRDP_WITH_CLIPBOARD
     g_mutex_lock (&priv->state_lock);
+    if (priv->clipboard_channel != NULL)
+      frdp_channel_clipboard_detach (priv->clipboard_channel);
     g_clear_object (&priv->clipboard_channel);
-    priv->clipboard_channel = g_object_new (FRDP_TYPE_CHANNEL_CLIPBOARD,
-                                            "session", session,
-                                            "cliprdr-client-context", (CliprdrClientContext *) e->pInterface,
-                                            NULL);
+    priv->clipboard_channel = frdp_channel_clipboard_new (session, (CliprdrClientContext *) e->pInterface);
     g_mutex_unlock (&priv->state_lock);
-#endif
   } else if (strcmp (e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0) {
     // TODO Multiparty channel
   } else if (strcmp (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
@@ -1085,11 +1078,11 @@ frdp_on_channel_disconnected_event_handler (void                                
   } else if (strcmp (e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
     gdi_graphics_pipeline_uninit (ctx->context.gdi, (RdpgfxClientContext *) e->pInterface);
   } else if (strcmp (e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
-#ifdef FRDP_WITH_CLIPBOARD
     g_mutex_lock (&priv->state_lock);
+    if (priv->clipboard_channel != NULL)
+      frdp_channel_clipboard_detach (priv->clipboard_channel);
     g_clear_object (&priv->clipboard_channel);
     g_mutex_unlock (&priv->state_lock);
-#endif
   } else if (strcmp (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
     gdi_video_geometry_uninit (ctx->context.gdi, (GeometryClientContext *) e->pInterface);
   } else if (strcmp (e->name, VIDEO_CONTROL_DVC_CHANNEL_NAME) == 0) {
@@ -1600,9 +1593,7 @@ frdp_session_finalize (GObject *object)
   g_clear_object (&priv->frame);
   g_clear_object (&priv->cursor_texture);
   g_clear_object (&priv->display_control_channel);
-#ifdef FRDP_WITH_CLIPBOARD
   g_clear_object (&priv->clipboard_channel);
-#endif
 
   g_mutex_clear (&priv->frame_lock);
   g_mutex_clear (&priv->state_lock);
@@ -1806,6 +1797,13 @@ frdp_session_connect_finish (FrdpSession   *self,
   g_return_val_if_fail (g_task_is_valid (result, self), FALSE);
 
   return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+/* Main thread. The display widget, or NULL once it has been disposed. */
+GtkWidget *
+frdp_session_get_display_widget (FrdpSession *self)
+{
+  return self->priv->display;
 }
 
 gboolean

@@ -75,6 +75,8 @@ gboolean     frdp_session_connect_finish (FrdpSession          *self,
 
 gboolean     frdp_session_is_open        (FrdpSession          *self);
 
+GtkWidget   *frdp_session_get_display_widget (FrdpSession      *self);
+
 void         frdp_session_close          (FrdpSession          *self);
 
 void         frdp_session_mouse_event    (FrdpSession          *self,

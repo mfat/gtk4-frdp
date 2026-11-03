@@ -1,23 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* frdp-channel-clipboard.h
+/* frdp-channel-clipboard.h — RDP clipboard redirection (cliprdr) for GTK 4
  *
- * Copyright (C) 2023 Marek Kasik <mkasik@redhat.com>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Copyright (C) 2026 mFat
  */
-
 #pragma once
+
+#include <freerdp/client/cliprdr.h>
 
 #include "frdp-channel.h"
 
@@ -25,18 +13,16 @@ G_BEGIN_DECLS
 
 #define FRDP_TYPE_CHANNEL_CLIPBOARD (frdp_channel_clipboard_get_type())
 
-G_DECLARE_FINAL_TYPE (FrdpChannelClipboard, frdp_channel_clipboard, FRDP, CHANNEL_CLIPBOARD, GObject)
+G_DECLARE_FINAL_TYPE (FrdpChannelClipboard, frdp_channel_clipboard, FRDP, CHANNEL_CLIPBOARD, FrdpChannel)
 
-typedef struct _FrdpChannelClipboard FrdpChannelClipboard;
+/* Session thread: creates the channel for a connected cliprdr context and
+ * installs its callbacks. The GTK side is attached on the main thread. */
+FrdpChannelClipboard *frdp_channel_clipboard_new    (gpointer              session,
+                                                     CliprdrClientContext *context);
 
-struct _FrdpChannelClipboard
-{
-  GObject parent_instance;
-};
-
-struct _FrdpChannelClipboardClass
-{
-  FrdpChannelClass parent_class;
-};
+/* Session thread: the cliprdr channel is going away. After this returns the
+ * context is never touched again; the GTK side is released on the main
+ * thread. */
+void                  frdp_channel_clipboard_detach (FrdpChannelClipboard *self);
 
 G_END_DECLS

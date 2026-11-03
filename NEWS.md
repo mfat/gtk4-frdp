@@ -17,8 +17,10 @@ First release as a standalone GTK 4 library, derived from gtk-frdp
   `gtk4-frdp-4.0`, header `<gtk4-frdp.h>`.
 - `password` is write-only.
 - FreeRDP 3.11 or newer is required; FreeRDP 2 support was removed.
-- Clipboard is not available yet: gtk-frdp's GTK 3 clipboard channel is
-  kept in the tree but not built until it is ported to GTK 4.
+- New clipboard implementation for GTK 4 (gtk-frdp's GTK 3/FUSE one is
+  replaced): text, images and HTML in both directions, fully asynchronous,
+  on the session-thread model. Images are converted without depending on
+  WinPR's optional PNG support. No file transfer yet.
 - Fixed from gtk-frdp: the widget, its session and the FreeRDP context were
   never freed; use-after-free after a failed connection; a certificate
   prompt answered from its signal handler hung; a hidden widget stopped

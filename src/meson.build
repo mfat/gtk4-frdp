@@ -16,6 +16,8 @@ private_sources = [
   'frdp-session.c',
   'frdp-channel.c',
   'frdp-channel-display-control.c',
+  'frdp-channel-clipboard.c',
+  'frdp-dib.c',
   'frdp-keyboard-layout.c',
   'frdp-xkb-layout-ids.c',
 ]
@@ -53,9 +55,6 @@ c_args = [
   '-DG_LOG_DOMAIN="Gtk4Frdp"',
 ]
 
-# frdp-channel-clipboard.c is still the GTK 3 implementation from gtk-frdp
-# and is not built: it needs porting to GdkClipboard (asynchronous) and to
-# the session thread. FRDP_WITH_CLIPBOARD marks the hooks in frdp-session.c.
 
 gtk4_frdp_lib = shared_library(package_api_name,
   public_sources + private_sources + [version_header],
