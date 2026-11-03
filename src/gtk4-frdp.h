@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
-/* gtk-frdp.h
+/* gtk4-frdp.h
  *
  * Copyright (C) 2018 Felipe Borges <felipeborges@gnome.org>
  *
@@ -17,8 +17,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef GTK_FRDP_H
-#define GTK_FRDP_H
+#ifndef GTK4_FRDP_H
+#define GTK4_FRDP_H
 
 #include <frdp-display.h>
 #include <gtk/gtk.h>
@@ -26,10 +26,10 @@
 
 G_BEGIN_DECLS
 
-#define GTK_FRDP_INSIDE
-# include "gtk-frdp-version.h"
-#undef GTK_FRDP_INSIDE
+#define GTK4_FRDP_INSIDE
+# include "gtk4-frdp-version.h"
+#undef GTK4_FRDP_INSIDE
 
 G_END_DECLS
 
-#endif /* GTK_FRDP_H */
+#endif /* GTK4_FRDP_H */

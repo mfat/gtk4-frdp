@@ -14,7 +14,8 @@
  *    never waits on the network. (Upstream connected on the main thread and
  *    froze the UI for the whole connect: 15 s for an unreachable host.)
  *  - FreeRDP callbacks therefore run on the worker. Anything that touches
- *    GTK is marshalled to the main thread with g_main_context_invoke().
+ *    GTK is marshalled to the main thread by queueing idle sources on the
+ *    default main context (never g_main_context_invoke(), see below).
  *  - The framebuffer is guarded by frame_lock, held from BeginPaint to
  *    EndPaint (and around gdi_init/resize/free); snapshot() copies it into an
  *    immutable GdkTexture under the same lock.
@@ -207,19 +208,33 @@ static void frdp_session_update_mouse_pointer (FrdpSession *self);
 
 /* ---- main-thread marshalling ------------------------------------------- */
 
-static gboolean
-frdp_session_in_main_thread (void)
+/* Queues @func(data) on the default main context (the GTK thread).
+ *
+ * Deliberately not g_main_context_invoke(): when no thread owns the context
+ * at that moment (an application iterating the loop by hand, or before its
+ * loop starts), it runs the function right away on the *calling* thread.
+ * That ran the clean-up on the session thread, which then tried to join
+ * itself ("Resource deadlock avoided" abort, found by tests/test-widget.py). */
+static void
+frdp_main_context_queue (GSourceFunc    func,
+                         gpointer       data,
+                         GDestroyNotify notify)
 {
-  return g_main_context_is_owner (g_main_context_default ());
+  GSource *source = g_idle_source_new ();
+
+  g_source_set_priority (source, G_PRIORITY_DEFAULT);
+  g_source_set_callback (source, func, data, notify);
+  g_source_set_static_name (source, "[gtk4-frdp] main-thread call");
+  g_source_attach (source, g_main_context_default ());
+  g_source_unref (source);
 }
 
-/* Runs @func(self) on the main thread (immediately if already there). */
+/* Runs @func(self) on the main thread, always asynchronously. */
 static void
 frdp_session_run_on_main (FrdpSession *self,
                           GSourceFunc  func)
 {
-  g_main_context_invoke_full (NULL, G_PRIORITY_DEFAULT, func,
-                              g_object_ref (self), g_object_unref);
+  frdp_main_context_queue (func, g_object_ref (self), g_object_unref);
 }
 
 static gboolean
@@ -810,8 +825,7 @@ frdp_session_prompt (FrdpSession       *self,
   g_mutex_unlock (&priv->prompt_lock);
 
   req->self = g_object_ref (self);
-  g_main_context_invoke_full (NULL, G_PRIORITY_DEFAULT,
-                              frdp_prompt_on_main, req, frdp_prompt_request_free);
+  frdp_main_context_queue (frdp_prompt_on_main, req, frdp_prompt_request_free);
 
   g_mutex_lock (&priv->prompt_lock);
   while (!priv->prompt_answered && !g_atomic_int_get (&priv->closing))
@@ -1065,11 +1079,7 @@ frdp_pre_connect (freerdp *freerdp_session)
   PubSub_SubscribeChannelDisconnected (context->pubSub,
                                        frdp_on_channel_disconnected_event_handler);
 
-#ifndef HAVE_FREERDP3
-  return frdp_load_channels (freerdp_session);
-#else
   return TRUE;
-#endif
 }
 
 /* Worker. */
@@ -1301,7 +1311,6 @@ frdp_session_set_current_keyboard_layout (FrdpSession *self) {
   const gchar           *source_type = NULL, *layout = NULL;
   GSettings             *gsettings;
   GVariant              *sources;
-  gboolean               keyboard_layout_set = FALSE;
   guint                  i;
 
   settings = priv->freerdp_session->context->settings;
@@ -1319,12 +1328,7 @@ frdp_session_set_current_keyboard_layout (FrdpSession *self) {
       if (layout != NULL) {
         for (i = 0; i < G_N_ELEMENTS (keyboard_layouts); i++) {
           if (g_strcmp0 (layout, keyboard_layouts[i].local_layout) == 0) {
-#ifdef HAVE_FREERDP_3_11_0
             freerdp_settings_set_uint32 (settings, FreeRDP_KeyboardLayout, keyboard_layouts[i].freerdp_layout);
-#else
-            settings->KeyboardLayout = freerdp_keyboard_init (keyboard_layouts[i].freerdp_layout);
-#endif
-            keyboard_layout_set = TRUE;
             break;
           }
         }
@@ -1335,11 +1339,6 @@ frdp_session_set_current_keyboard_layout (FrdpSession *self) {
       g_settings_schema_unref (schema);
     }
   }
-
-#ifndef HAVE_FREERDP_3_11_0
-  if (!keyboard_layout_set)
-    settings->KeyboardLayout = freerdp_keyboard_init (0);
-#endif
 }
 
 static gboolean
@@ -1363,9 +1362,7 @@ frdp_session_init_freerdp (FrdpSession *self)
   priv->freerdp_session->AuthenticateEx = frdp_authenticate_ex;
   priv->freerdp_session->VerifyCertificateEx = frdp_certificate_verify_ex;
   priv->freerdp_session->VerifyChangedCertificateEx = frdp_changed_certificate_verify_ex;
-#ifdef HAVE_FREERDP3
   priv->freerdp_session->LoadChannels = frdp_load_channels;
-#endif
 
   priv->freerdp_session->ContextSize = sizeof (frdpContext);
 

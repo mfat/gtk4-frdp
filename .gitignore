@@ -1,4 +1,6 @@
-inst/
-spike/*.log
-spike/*.png
-spike/*.pid
+/_build*/
+/build*/
+/inst/
+*.log
+*.pid
+__pycache__/

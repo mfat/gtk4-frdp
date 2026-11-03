@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* NOT BUILT: still the GTK 3 implementation from gtk-frdp. It needs porting
+ * to GdkClipboard (asynchronous) and to the session thread before it can be
+ * enabled again; see src/meson.build. */
 /* frdp-channel-clipboard.c
  *
  * Copyright (C) 2023 Marek Kasik <mkasik@redhat.com>

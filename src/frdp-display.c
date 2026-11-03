@@ -33,6 +33,52 @@
 
 #include <freerdp/channels/disp.h>
 
+/**
+ * FrdpDisplay:
+ *
+ * A widget that shows a remote desktop over RDP and forwards keyboard and
+ * mouse input to it, using FreeRDP 3.
+ *
+ * Typical use:
+ *
+ * ```c
+ * GtkWidget *display = frdp_display_new ();
+ * g_object_set (display,
+ *               "username", "alice",
+ *               "password", password,       // write-only
+ *               "allow-resize", TRUE,       // follow the widget size
+ *               NULL);
+ * g_signal_connect (display, "rdp-needs-certificate-verification",
+ *                   G_CALLBACK (on_certificate), NULL);
+ * gtk_window_set_child (window, display);
+ * frdp_display_open_host (FRDP_DISPLAY (display), "rdp.example.com", 3389);
+ * ```
+ *
+ * ## Threading
+ *
+ * Each connection runs on its own session thread, which owns FreeRDP:
+ * connecting, network I/O and decoding never block the GTK main thread.
+ * All signals are emitted on the main thread. [method@GtkFrdp.Display.open_host]
+ * and [method@GtkFrdp.Display.close] return immediately; completion is reported
+ * by [signal@GtkFrdp.Display::rdp-connected] and
+ * [signal@GtkFrdp.Display::rdp-disconnected].
+ *
+ * ## Prompts
+ *
+ * When FreeRDP needs a decision — an unknown or changed server certificate,
+ * or credentials — the widget emits a `rdp-needs-*` signal and the session
+ * thread waits. Answer from the handler or later (for example after a
+ * dialog) with [method@GtkFrdp.Display.certificate_verify_ex_finish],
+ * [method@GtkFrdp.Display.certificate_change_verify_ex_finish] or
+ * [method@GtkFrdp.Display.authenticate_finish]. Closing the display while a
+ * prompt is pending rejects it.
+ *
+ * ## Lifetime
+ *
+ * Dropping the last reference closes the connection; resources are freed
+ * once the session thread has stopped.
+ */
+
 struct _FrdpDisplayPrivate
 {
   FrdpSession *session;
@@ -372,10 +418,6 @@ frdp_display_get_property (GObject      *object,
         g_object_get (session, "username", &str_property, NULL);
         g_value_take_string (value, str_property);
         break;
-      case PROP_PASSWORD:
-        g_object_get (session, "password", &str_property, NULL);
-        g_value_take_string (value, str_property);
-        break;
       case PROP_DOMAIN:
         g_object_get (session, "domain", &str_property, NULL);
         g_value_take_string (value, str_property);
@@ -466,6 +508,11 @@ frdp_display_class_init (FrdpDisplayClass *klass)
   widget_class->snapshot = frdp_display_snapshot;
   widget_class->size_allocate = frdp_display_size_allocate;
 
+  /**
+   * FrdpDisplay:username:
+   *
+   * User name for the connection. Set before [method@GtkFrdp.Display.open_host].
+   */
   g_object_class_install_property (gobject_class,
                                    PROP_USERNAME,
                                    g_param_spec_string ("username",
@@ -474,14 +521,27 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                         NULL,
                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
 
+  /**
+   * FrdpDisplay:password:
+   *
+   * Password for the connection. Write-only: it cannot be read back.
+   */
   g_object_class_install_property (gobject_class,
                                    PROP_PASSWORD,
+                                   /* Write-only: the password must not be
+                                    * readable back out of the widget
+                                    * (upstream exposed it read-write). */
                                    g_param_spec_string ("password",
                                                         "password",
-                                                        "password",
+                                                        "Password for the connection (write-only)",
                                                         NULL,
-                                                        G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
+                                                        G_PARAM_STATIC_STRINGS | G_PARAM_WRITABLE));
 
+  /**
+   * FrdpDisplay:domain:
+   *
+   * Optional Windows domain for the connection.
+   */
   g_object_class_install_property (gobject_class,
                                    PROP_DOMAIN,
                                    g_param_spec_string ("domain",
@@ -490,6 +550,13 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                         NULL,
                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
 
+  /**
+   * FrdpDisplay:scaling:
+   *
+   * Whether the remote desktop is scaled to fit the widget (keeping its
+   * aspect ratio). When %FALSE it is shown 1:1 and the widget requests the
+   * desktop size.
+   */
   g_object_class_install_property (gobject_class,
                                    PROP_SCALING,
                                    g_param_spec_boolean ("scaling",
@@ -498,6 +565,12 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                          TRUE,
                                                          G_PARAM_READWRITE));
 
+  /**
+   * FrdpDisplay:allow-resize:
+   *
+   * Whether to ask the server to change its resolution to match the widget
+   * size (Display Control channel). Requests are debounced while resizing.
+   */
   g_object_class_install_property (gobject_class,
                                    PROP_ALLOW_RESIZE,
                                    g_param_spec_boolean ("allow-resize",
@@ -506,6 +579,13 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                          FALSE,
                                                          G_PARAM_READWRITE));
 
+  /**
+   * FrdpDisplay:resize-supported:
+   *
+   * Whether the server supports resolution changes
+   * ([property@GtkFrdp.Display:allow-resize]). Becomes %TRUE after connecting
+   * if the server offers the Display Control channel.
+   */
   g_object_class_install_property (gobject_class,
                                    PROP_RESIZE_SUPPORTED,
                                    g_param_spec_boolean ("resize-supported",
@@ -514,6 +594,14 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                          FALSE,
                                                          G_PARAM_READWRITE));
 
+  /**
+   * FrdpDisplay::rdp-error:
+   * @display: the display
+   * @message: a description of the error
+   *
+   * Emitted when the connection fails for a reason other than
+   * authentication, or ends because of an error.
+   */
   signals[RDP_ERROR] = g_signal_new ("rdp-error",
                                      G_TYPE_FROM_CLASS (klass),
                                      G_SIGNAL_RUN_LAST,
@@ -521,24 +609,53 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                      G_TYPE_NONE, 1,
                                      G_TYPE_STRING);
 
+  /**
+   * FrdpDisplay::rdp-connected:
+   * @display: the display
+   *
+   * Emitted when the session is established and input can be sent.
+   */
   signals[RDP_CONNECTED] = g_signal_new ("rdp-connected",
                                          G_TYPE_FROM_CLASS (klass),
                                          G_SIGNAL_RUN_LAST,
                                          0, NULL, NULL, NULL,
                                          G_TYPE_NONE, 0);
 
+  /**
+   * FrdpDisplay::rdp-disconnected:
+   * @display: the display
+   *
+   * Emitted once when a session ends, whether it failed to connect, was
+   * closed by the server, or was closed with [method@GtkFrdp.Display.close].
+   * The display can then be reused with [method@GtkFrdp.Display.open_host].
+   */
   signals[RDP_DISCONNECTED] = g_signal_new ("rdp-disconnected",
                                             G_TYPE_FROM_CLASS (klass),
                                             G_SIGNAL_RUN_LAST,
                                             0, NULL, NULL, NULL,
                                             G_TYPE_NONE, 0);
 
+  /**
+   * FrdpDisplay::rdp-needs-authentication:
+   * @display: the display
+   *
+   * Emitted when the server needs credentials that were not provided.
+   * Answer with [method@GtkFrdp.Display.authenticate_finish].
+   */
   signals[RDP_NEEDS_AUTHENTICATION] = g_signal_new ("rdp-needs-authentication",
                                                     G_TYPE_FROM_CLASS (klass),
                                                     G_SIGNAL_RUN_LAST,
                                                     0, NULL, NULL, NULL,
                                                     G_TYPE_NONE, 0);
 
+  /**
+   * FrdpDisplay::rdp-auth-failure:
+   * @display: the display
+   * @message: a description of the failure
+   *
+   * Emitted when connecting fails because of authentication, the transport
+   * or name resolution (wrong password, unreachable host, ...).
+   */
   signals[RDP_AUTH_FAILURE] = g_signal_new ("rdp-auth-failure",
                                             G_TYPE_FROM_CLASS (klass),
                                             G_SIGNAL_RUN_LAST,
@@ -546,6 +663,21 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                             G_TYPE_NONE, 1,
                                             G_TYPE_STRING);
 
+  /**
+   * FrdpDisplay::rdp-needs-certificate-verification:
+   * @display: the display
+   * @host: the server host
+   * @port: the server port
+   * @common_name: the certificate common name
+   * @subject: the certificate subject
+   * @issuer: the certificate issuer
+   * @fingerprint: the certificate fingerprint
+   * @flags: FreeRDP `VERIFY_CERT_FLAG_*` flags
+   *
+   * Emitted for a certificate FreeRDP has not seen before. Answer with
+   * [method@GtkFrdp.Display.certificate_verify_ex_finish]: 1 accepts and stores
+   * it, 2 accepts it for this session only, 0 rejects.
+   */
   signals[RDP_NEEDS_CERTIFICATE_VERIFICATION] = g_signal_new ("rdp-needs-certificate-verification",
                                                               G_TYPE_FROM_CLASS (klass),
                                                               G_SIGNAL_RUN_LAST,
@@ -559,6 +691,23 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                               G_TYPE_STRING,
                                                               G_TYPE_UINT);
 
+  /**
+   * FrdpDisplay::rdp-needs-certificate-change-verification:
+   * @display: the display
+   * @host: the server host
+   * @port: the server port
+   * @common_name: the new certificate common name
+   * @subject: the new certificate subject
+   * @issuer: the new certificate issuer
+   * @fingerprint: the new certificate fingerprint
+   * @old_subject: the stored certificate subject
+   * @old_issuer: the stored certificate issuer
+   * @old_fingerprint: the stored certificate fingerprint
+   * @flags: FreeRDP `VERIFY_CERT_FLAG_*` flags
+   *
+   * Emitted when the server certificate differs from the stored one.
+   * Answer with [method@GtkFrdp.Display.certificate_change_verify_ex_finish].
+   */
   signals[RDP_NEEDS_CERTIFICATE_CHANGE_VERIFICATION] = g_signal_new ("rdp-needs-certificate-change-verification",
                                                                      G_TYPE_FROM_CLASS (klass),
                                                                      G_SIGNAL_RUN_LAST,
@@ -732,7 +881,7 @@ frdp_display_set_allow_resize (FrdpDisplay *display,
   gtk_widget_queue_draw (GTK_WIDGET (display));
 }
 
-/*
+/**
  * frdp_display_new:
  *
  * Create a new widget capable of connecting to a RDP server
@@ -760,9 +909,9 @@ _frdp_display_request_authentication (FrdpDisplay *self)
   g_signal_emit (self, signals[RDP_NEEDS_AUTHENTICATION], 0);
 }
 
-/*
+/**
  * frdp_display_authenticate_finish:
- * @display: (transfer none): the RDP display widget
+ * @self: (transfer none): the RDP display widget
  * @username: (transfer none) (nullable): username for the connection
  * @password: (transfer none) (nullable): password for the connection
  * @domain: (transfer none) (nullable): optional domain for the connection
@@ -852,7 +1001,7 @@ clamp_verification (guint verification)
 
 /**
  * frdp_display_certificate_verify_ex_finish:
- * @display: (transfer none): the RDP display widget
+ * @self: (transfer none): the RDP display widget
  * @verification: verification value (1 - accept and store the certificate,
  *                                    2 - accept the certificate for this session only
  *                                    0 - otherwise)
@@ -871,7 +1020,7 @@ frdp_display_certificate_verify_ex_finish (FrdpDisplay *display,
 
 /**
  * frdp_display_certificate_change_verify_ex_finish:
- * @display: (transfer none): the RDP display widget
+ * @self: (transfer none): the RDP display widget
  * @verification: verification value (1 - accept and store the certificate,
  *                                    2 - accept the certificate for this session only
  *                                    0 - otherwise)
@@ -929,6 +1078,16 @@ frdp_display_keyboard_ungrab (FrdpDisplay *display)
   priv->keyboard_grabbed = FALSE;
 }
 
+/**
+ * frdp_display_is_keyboard_grabbed:
+ * @self: the RDP display widget
+ *
+ * Whether system shortcuts (Super, Alt+Tab, ...) are currently inhibited so
+ * that they reach the remote session. This is the case while the pointer is
+ * over the display.
+ *
+ * Returns: %TRUE if system shortcuts go to the remote session
+ */
 gboolean
 frdp_display_is_keyboard_grabbed (FrdpDisplay *self)
 {

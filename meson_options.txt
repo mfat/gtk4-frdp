@@ -1,13 +1,16 @@
-option ('examples',
-        type: 'boolean',
-        value: false,
-        description: 'Whether to build and install the example/demo app')
+# SPDX-License-Identifier: GPL-3.0-or-later
+option('introspection',
+       type: 'boolean', value: true,
+       description: 'Generate GObject Introspection data (needed for Python, JavaScript, ...)')
 
-option ('package_subdir',
-        type: 'string',
-        description: 'Subdir for when gtk-frdp is consumed as a subproject')
+option('examples',
+       type: 'boolean', value: false,
+       description: 'Build the example viewer')
 
-option ('clipboard',
-        type: 'boolean',
-        value: false,
-        description: 'Clipboard channel (needs FUSE3 for file transfer; Linux only)')
+option('tests',
+       type: 'boolean', value: true,
+       description: 'Build and register the test suite')
+
+option('documentation',
+       type: 'boolean', value: false,
+       description: 'Build the API reference with gi-docgen (requires introspection)')

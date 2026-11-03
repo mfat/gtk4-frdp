@@ -1,25 +1,24 @@
-# GTK4 port (sshPilot embedded-RDP spike). Differences from upstream:
-#  * gtk4 instead of gtk+-3.0; FreeRDP 3 only (no FreeRDP 2 fallback)
-#  * clipboard channel optional (it hard-requires FUSE3)
-#  * GIR namespace GtkFrdp-4.0 so it never clashes with the GTK3 GtkFrdp-0.2
-#  * no Vala bindings
-api_version = '4.0'
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-gtk_frdp_public_sources = [
-  'frdp-display.c',
-  'frdp-session.c'
+# Public API: the FrdpDisplay widget only. FrdpSession, the channel objects
+# and the FreeRDP context are implementation details and are neither
+# installed nor introspected, so they can change without an API break.
+public_headers = [
+  'frdp-display.h',
+  'gtk4-frdp.h',
 ]
 
-gtk_frdp_private_sources = [
+public_sources = [
+  'frdp-display.c',
+]
+
+private_sources = [
+  'frdp-session.c',
   'frdp-channel.c',
   'frdp-channel-display-control.c',
 ]
 
-gtk_frdp_public_headers = [
-  'frdp-display.h',
-  'frdp-session.h',
-  'gtk-frdp.h'
-]
+header_subdir = 'gtk4-frdp'
 
 version_split = meson.project_version().split('.')
 version_conf = configuration_data()
@@ -28,63 +27,75 @@ version_conf.set('MAJOR_VERSION', version_split[0])
 version_conf.set('MINOR_VERSION', version_split[1])
 version_conf.set('MICRO_VERSION', version_split[2])
 
-gtk_frdp_header_subdir = join_paths(package_subdir, 'gtk4-frdp')
-gtk_frdp_header_dir = join_paths(get_option('includedir'), gtk_frdp_header_subdir)
-
-configure_file(
-  input: 'gtk-frdp-version.h.in',
-  output: 'gtk-frdp-version.h',
+version_header = configure_file(
+  input: 'gtk4-frdp-version.h.in',
+  output: 'gtk4-frdp-version.h',
   configuration: version_conf,
   install: true,
-  install_dir: gtk_frdp_header_dir
+  install_dir: get_option('includedir') / header_subdir,
 )
 
-cc = meson.get_compiler('c')
+freerdp_dep = dependency('freerdp3', version: '>= 3.11.0')
 
-freerdp3_dep = dependency('freerdp3', version: '>= 3.11.0')
-add_project_arguments('-DHAVE_FREERDP3', '-DHAVE_FREERDP_3_11_0', language: 'c')
-
-gtk_frdp_deps = [
+deps = [
   dependency('gio-2.0', version: '>= 2.66'),
   dependency('gtk4', version: '>= 4.14'),
-  freerdp3_dep,
-  dependency('winpr3', version: '>= 3.0.0'),
-  dependency('freerdp-client3'),
+  freerdp_dep,
+  dependency('winpr3', version: '>= 3.11.0'),
+  dependency('freerdp-client3', version: '>= 3.11.0'),
   cc.find_library('m', required: false),
 ]
 
-if get_option('clipboard')
-  gtk_frdp_deps += dependency('fuse3', version: '>= 3.9.1')
-  gtk_frdp_private_sources += 'frdp-channel-clipboard.c'
-  add_project_arguments('-DFRDP_WITH_CLIPBOARD', language: 'c')
-endif
+c_args = [
+  '-DGTK4_FRDP_COMPILATION',
+  '-DG_LOG_DOMAIN="Gtk4Frdp"',
+]
 
-gtk_frdp_lib = shared_library('gtk4-frdp-' + api_version,
-  gtk_frdp_public_sources + gtk_frdp_private_sources,
-  dependencies: gtk_frdp_deps,
+# frdp-channel-clipboard.c is still the GTK 3 implementation from gtk-frdp
+# and is not built: it needs porting to GdkClipboard (asynchronous) and to
+# the session thread. FRDP_WITH_CLIPBOARD marks the hooks in frdp-session.c.
+
+gtk4_frdp_lib = shared_library(package_api_name,
+  public_sources + private_sources + [version_header],
+  dependencies: deps,
+  c_args: c_args,
+  version: '0.0.0',
+  soversion: '0',
+  gnu_symbol_visibility: 'default',
   install: true,
-  install_dir: libdir
 )
 
-gtk_frdp_dep = declare_dependency(
-  sources: gtk_frdp_public_headers,
-  dependencies: gtk_frdp_deps,
-  link_with: gtk_frdp_lib,
+install_headers(public_headers, subdir: header_subdir)
+
+gtk4_frdp_dep = declare_dependency(
+  link_with: gtk4_frdp_lib,
   include_directories: include_directories('.'),
+  sources: [version_header],
+  dependencies: [ dependency('gtk4') ],
+)
+meson.override_dependency(package_api_name, gtk4_frdp_dep)
+
+pkg.generate(gtk4_frdp_lib,
+  name: 'gtk4-frdp',
+  filebase: package_api_name,
+  description: 'GTK 4 widget for embedding FreeRDP 3 remote desktops',
+  subdirs: header_subdir,
+  requires: [ 'gtk4' ],
+  requires_private: [ 'freerdp3', 'winpr3', 'freerdp-client3' ],
 )
 
-install_headers(gtk_frdp_public_headers, subdir: gtk_frdp_header_subdir)
-
-gtk_frdp_gir = gnome.generate_gir(gtk_frdp_lib,
-  sources: gtk_frdp_public_sources + gtk_frdp_public_headers,
-  nsversion: api_version,
-  namespace: 'GtkFrdp',
-  symbol_prefix: 'frdp',
-  identifier_prefix: 'Frdp',
-  link_with: gtk_frdp_lib,
-  includes: ['Gio-2.0', 'Gtk-4.0'],
-  install: true,
-  install_dir_gir: girdir,
-  install_dir_typelib: typelibdir,
-  extra_args: [ '--c-include=gtk-frdp.h', '--quiet' ],
-)
+if get_option('introspection')
+  gtk4_frdp_gir = gnome.generate_gir(gtk4_frdp_lib,
+    sources: public_sources + public_headers + [version_header],
+    nsversion: api_version,
+    namespace: 'GtkFrdp',
+    # gtk4_frdp: the GTK4_FRDP_* version macros become GtkFrdp constants.
+    symbol_prefix: [ 'frdp', 'gtk4_frdp' ],
+    identifier_prefix: 'Frdp',
+    includes: [ 'Gio-2.0', 'Gtk-4.0' ],
+    header: 'gtk4-frdp.h',
+    export_packages: package_api_name,
+    install: true,
+    extra_args: [ '--quiet', '-DGTK4_FRDP_COMPILATION' ],
+  )
+endif
