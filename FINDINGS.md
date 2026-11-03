@@ -105,8 +105,8 @@ Screenshots `05`/`06`: input and remote resize through the threaded session.
 ## Remaining work before this could ship
 
 1. Clipboard: text-only path without FUSE; file clipboard Linux-only.
-3. Keyboard layout detection reads GNOME settings (Linux only).
-4. Cursor is not scaled with the remote-desktop scale factor.
-5. macOS and Windows builds (MSYS2 / Homebrew): not attempted; the key-code
+2. Keyboard layout detection reads GNOME settings (Linux only).
+3. Cursor is not scaled with the remote-desktop scale factor.
+4. macOS and Windows builds (MSYS2 / Homebrew): not attempted; the key-code
    and event-loop code paths for them are written but untested.
-6. Password is a readable GObject property (also upstream); should be write-only.
+5. Password is a readable GObject property (also upstream); should be write-only.
