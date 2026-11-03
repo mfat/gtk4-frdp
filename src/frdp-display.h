@@ -26,8 +26,22 @@
 
 G_BEGIN_DECLS
 
+/* Windows DLLs only export what is marked: MinGW exports everything by
+ * default, MSVC and clang-cl export nothing. Elsewhere the library's
+ * default visibility applies. */
+#if defined(_WIN32) || defined(__CYGWIN__)
+# ifdef GTK4_FRDP_COMPILATION
+#  define GTK4_FRDP_EXPORT __declspec(dllexport) extern
+# else
+#  define GTK4_FRDP_EXPORT __declspec(dllimport) extern
+# endif
+#else
+# define GTK4_FRDP_EXPORT extern
+#endif
+
 #define FRDP_TYPE_DISPLAY (frdp_display_get_type())
 
+GTK4_FRDP_EXPORT
 G_DECLARE_DERIVABLE_TYPE (FrdpDisplay, frdp_display, FRDP, DISPLAY, GtkWidget)
 
 typedef struct _FrdpDisplayPrivate FrdpDisplayPrivate;
@@ -39,30 +53,39 @@ struct _FrdpDisplayClass
   gboolean (*authenticate) (FrdpDisplay *self, gchar **username, gchar **password, gchar **domain);
 };
 
+GTK4_FRDP_EXPORT
 GtkWidget *frdp_display_new       (void);
 
+GTK4_FRDP_EXPORT
 void       frdp_display_open_host (FrdpDisplay *display,
                                    const gchar *host,
                                    guint        port);
 
+GTK4_FRDP_EXPORT
 gboolean   frdp_display_is_open   (FrdpDisplay *display);
 
+GTK4_FRDP_EXPORT
 void       frdp_display_close     (FrdpDisplay *display);
 
+GTK4_FRDP_EXPORT
 void       frdp_display_set_scaling (FrdpDisplay *display,
                                      gboolean     scaling);
 
+GTK4_FRDP_EXPORT
 void       frdp_display_certificate_verify_ex_finish (FrdpDisplay *self,
                                                       guint        verification);
 
+GTK4_FRDP_EXPORT
 void       frdp_display_certificate_change_verify_ex_finish (FrdpDisplay *self,
                                                              guint        verification);
 
+GTK4_FRDP_EXPORT
 void       frdp_display_authenticate_finish (FrdpDisplay *self,
                                              gchar       *username,
                                              gchar       *password,
                                              gchar       *domain);
 
+GTK4_FRDP_EXPORT
 gboolean   frdp_display_is_keyboard_grabbed (FrdpDisplay *self);
 
 G_END_DECLS
