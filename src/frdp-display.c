@@ -27,6 +27,7 @@
 #include "frdp-display.h"
 
 #include "frdp-session.h"
+#include "frdp-display-private.h"
 
 #include <freerdp/channels/disp.h>
 
@@ -37,12 +38,7 @@ struct _FrdpDisplayPrivate
   gboolean     allow_resize;
   gboolean     resize_supported;
 
-  gboolean     awaiting_certificate_verification;
-  gboolean     awaiting_certificate_change_verification;
-  gboolean     awaiting_authentication;
 
-  guint        certificate_verification_value;
-  guint        certificate_change_verification_value;
 
   gboolean     keyboard_grabbed;
 
@@ -452,11 +448,6 @@ frdp_display_dispose (GObject *object)
     g_clear_object (&priv->session);
   }
 
-  /* Unblock any nested prompt loop still waiting on this widget. */
-  priv->awaiting_authentication = FALSE;
-  priv->awaiting_certificate_verification = FALSE;
-  priv->awaiting_certificate_change_verification = FALSE;
-
   G_OBJECT_CLASS (frdp_display_parent_class)->dispose (object);
 }
 
@@ -754,51 +745,28 @@ GtkWidget *frdp_display_new (void)
   return GTK_WIDGET (g_object_new (FRDP_TYPE_DISPLAY, NULL));
 }
 
-gboolean
-frdp_display_authenticate (FrdpDisplay  *self,
-                           gchar       **username,
-                           gchar       **password,
-                           gchar       **domain)
+/* ---- prompts ------------------------------------------------------------
+ *
+ * The session thread blocks (on a condition variable, not a nested main
+ * loop) while the application answers. These run on the main thread and
+ * only emit the signal; the *_finish() functions deliver the answer.
+ */
+
+void
+_frdp_display_request_authentication (FrdpDisplay *self)
 {
-  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
-  GMainContext       *context;
-
-  priv->awaiting_authentication = TRUE;
-
   g_signal_emit (self, signals[RDP_NEEDS_AUTHENTICATION], 0);
-
-  context = g_main_context_default ();
-
-  while (priv->awaiting_authentication)
-    g_main_context_iteration (context, TRUE);
-
-  *username = *password = *domain = NULL;
-  g_object_get (priv->session,
-                "username", username,
-                "password", password,
-                "domain", domain,
-                NULL);
-
-  if (*username != NULL && *username[0] == '\0' &&
-      *password != NULL && *password[0] == '\0' &&
-      *domain != NULL && *domain[0] == '\0')
-    return FALSE;
-
-  return TRUE;
 }
 
 /*
  * frdp_display_authenticate_finish:
  * @display: (transfer none): the RDP display widget
- * @username: (transfer none): username for the connection
- * @password: (transfer none): password for the connection
- * @domain: (transfer none): optional domain for the connection
+ * @username: (transfer none) (nullable): username for the connection
+ * @password: (transfer none) (nullable): password for the connection
+ * @domain: (transfer none) (nullable): optional domain for the connection
  *
- * This function finishes authentication which started in
- * frdp_display_authenticate() and stores given authentication
- * credentials into FrdpSession so that frdp_display_authenticate()
- * can pick them up later and pass them to FreeRDP.
- *
+ * Answers a #FrdpDisplay::rdp-needs-authentication request. Passing %NULL
+ * or empty values for all three cancels the authentication.
  */
 void
 frdp_display_authenticate_finish (FrdpDisplay *self,
@@ -807,6 +775,11 @@ frdp_display_authenticate_finish (FrdpDisplay *self,
                                   gchar       *domain)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+  gboolean            provided;
+
+  provided = (username != NULL && username[0] != '\0') ||
+             (password != NULL && password[0] != '\0') ||
+             (domain != NULL && domain[0] != '\0');
 
   g_object_set (priv->session,
                 "username", username,
@@ -814,27 +787,19 @@ frdp_display_authenticate_finish (FrdpDisplay *self,
                 "domain", domain,
                 NULL);
 
-  priv->awaiting_authentication = FALSE;
+  frdp_session_answer_prompt (priv->session, provided ? 1 : 0);
 }
 
-guint
-frdp_display_certificate_verify_ex (FrdpDisplay *display,
-                                    const gchar *host,
-                                    guint16      port,
-                                    const gchar *common_name,
-                                    const gchar *subject,
-                                    const gchar *issuer,
-                                    const gchar *fingerprint,
-                                    guint32      flags)
+void
+_frdp_display_request_certificate_verification (FrdpDisplay *display,
+                                                 const gchar *host,
+                                                 guint16      port,
+                                                 const gchar *common_name,
+                                                 const gchar *subject,
+                                                 const gchar *issuer,
+                                                 const gchar *fingerprint,
+                                                 guint32      flags)
 {
-  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
-  GMainContext       *context;
-
-  /* Set before emitting: upstream set it after, so a handler that
-   * answered synchronously had its answer overwritten and hung forever. */
-  priv->awaiting_certificate_verification = TRUE;
-  priv->certificate_verification_value = 0;
-
   g_signal_emit (display,
                  signals[RDP_NEEDS_CERTIFICATE_VERIFICATION],
                  0,
@@ -845,34 +810,21 @@ frdp_display_certificate_verify_ex (FrdpDisplay *display,
                  issuer,
                  fingerprint,
                  flags);
-
-  context = g_main_context_default ();
-
-  while (priv->awaiting_certificate_verification)
-    g_main_context_iteration (context, TRUE);
-
-  return priv->certificate_verification_value;
 }
 
-guint
-frdp_display_certificate_change_verify_ex (FrdpDisplay *display,
-                                           const gchar *host,
-                                           guint16      port,
-                                           const gchar *common_name,
-                                           const gchar *subject,
-                                           const gchar *issuer,
-                                           const gchar *fingerprint,
-                                           const gchar *old_subject,
-                                           const gchar *old_issuer,
-                                           const gchar *old_fingerprint,
-                                           guint32      flags)
+void
+_frdp_display_request_certificate_change_verification (FrdpDisplay *display,
+                                                        const gchar *host,
+                                                        guint16      port,
+                                                        const gchar *common_name,
+                                                        const gchar *subject,
+                                                        const gchar *issuer,
+                                                        const gchar *fingerprint,
+                                                        const gchar *old_subject,
+                                                        const gchar *old_issuer,
+                                                        const gchar *old_fingerprint,
+                                                        guint32      flags)
 {
-  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
-  GMainContext       *context;
-
-  priv->awaiting_certificate_change_verification = TRUE;
-  priv->certificate_change_verification_value = 0;
-
   g_signal_emit (display, signals[RDP_NEEDS_CERTIFICATE_CHANGE_VERIFICATION], 0,
                  host,
                  port,
@@ -884,13 +836,16 @@ frdp_display_certificate_change_verify_ex (FrdpDisplay *display,
                  old_issuer,
                  old_fingerprint,
                  flags);
+}
 
-  context = g_main_context_default ();
+static guint
+clamp_verification (guint verification)
+{
+  if (verification <= 2)
+    return verification;
 
-  while (priv->awaiting_certificate_change_verification)
-    g_main_context_iteration (context, TRUE);
-
-  return priv->certificate_change_verification_value;
+  g_warning ("Verification value is out of allowed values.");
+  return 0;
 }
 
 /**
@@ -900,7 +855,8 @@ frdp_display_certificate_change_verify_ex (FrdpDisplay *display,
  *                                    2 - accept the certificate for this session only
  *                                    0 - otherwise)
  *
- * Finishes verification requested by FreeRDP.
+ * Answers a #FrdpDisplay::rdp-needs-certificate-verification request. May be
+ * called from the signal handler or any time later on the main thread.
  */
 void
 frdp_display_certificate_verify_ex_finish (FrdpDisplay *display,
@@ -908,14 +864,7 @@ frdp_display_certificate_verify_ex_finish (FrdpDisplay *display,
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
 
-  if (verification <= 2) {
-    priv->certificate_verification_value = verification;
-  }
-  else {
-    priv->certificate_verification_value = 0;
-    g_warning ("Verification value is out of allowed values.");
-  }
-  priv->awaiting_certificate_verification = FALSE;
+  frdp_session_answer_prompt (priv->session, clamp_verification (verification));
 }
 
 /**
@@ -925,7 +874,7 @@ frdp_display_certificate_verify_ex_finish (FrdpDisplay *display,
  *                                    2 - accept the certificate for this session only
  *                                    0 - otherwise)
  *
- * Finishes verification requested by FreeRDP.
+ * Answers a #FrdpDisplay::rdp-needs-certificate-change-verification request.
  */
 void
 frdp_display_certificate_change_verify_ex_finish (FrdpDisplay *display,
@@ -933,14 +882,7 @@ frdp_display_certificate_change_verify_ex_finish (FrdpDisplay *display,
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
 
-  if (verification <= 2) {
-    priv->certificate_change_verification_value = verification;
-  }
-  else {
-    priv->certificate_change_verification_value = 0;
-    g_warning ("Verification value is out of allowed values.");
-  }
-  priv->awaiting_certificate_change_verification = FALSE;
+  frdp_session_answer_prompt (priv->session, clamp_verification (verification));
 }
 
 static GdkToplevel *

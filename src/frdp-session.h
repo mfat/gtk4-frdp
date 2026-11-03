@@ -102,6 +102,11 @@ void         frdp_session_size_allocated (FrdpSession          *self,
                                           int                   width,
                                           int                   height);
 
+/* Called (on the main thread) by FrdpDisplay when the application answers a
+ * certificate or authentication prompt; wakes the waiting session thread. */
+void         frdp_session_answer_prompt  (FrdpSession          *self,
+                                          guint                 value);
+
 /*FreeRDP fatal error codes*/
 typedef enum {
  FRDP_ERRCONNECT_CONNECT_CANCELLED = 0x2000B,

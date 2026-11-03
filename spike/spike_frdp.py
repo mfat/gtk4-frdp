@@ -87,6 +87,14 @@ class Spike(Gtk.Application):
         display.open_host(self.args.host, self.args.port)
         log(f"cycle {self.cycle}: open_host returned after "
             f"{time.monotonic() - self.t_connect:.2f}s")
+        if self.args.abort_after:
+            GLib.timeout_add(self.args.abort_after, self.abort_connect)
+        return False
+
+    def abort_connect(self):
+        log(f"cycle {self.cycle}: close() while connecting")
+        self.t_abort = time.monotonic()
+        self.display.close()
         return False
 
     def on_cert(self, display, host, port, cn, subject, issuer, fingerprint, flags):
@@ -119,7 +127,10 @@ class Spike(Gtk.Application):
         return False
 
     def on_disconnected(self, display):
-        log(f"cycle {self.cycle}: rdp-disconnected")
+        extra = ""
+        if getattr(self, "t_abort", None):
+            extra = f" ({time.monotonic() - self.t_abort:.2f}s after close)"
+        log(f"cycle {self.cycle}: rdp-disconnected{extra}")
         if display is not self.display:
             return
         self.win.set_child(None)
@@ -146,6 +157,7 @@ def main():
     p.add_argument("--cycles", type=int, default=0)
     p.add_argument("--hold", type=int, default=0)
     p.add_argument("--idle-cpu", type=int, default=0)
+    p.add_argument("--abort-after", type=int, default=0, help="ms after open_host to call close()")
     args = p.parse_args()
     log(f"pid {os.getpid()}")
     return Spike(args).run([sys.argv[0]])

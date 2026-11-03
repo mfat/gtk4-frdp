@@ -4,6 +4,26 @@
  * Copyright (C) 2019 Armin Novak <akallabeth@posteo.net>
  * Copyright (C) 2023 Marek Kasik <mkasik@redhat.com>
  *
+ * GTK4 port with a session thread (2026). Threading model, following
+ * Remmina's RDP plugin and FreeRDP's own SDL client:
+ *
+ *  - Each session has one worker thread that owns FreeRDP: it runs
+ *    freerdp_connect(), the event loop and all decoding. The GTK main thread
+ *    never waits on the network. (Upstream connected on the main thread and
+ *    froze the UI for the whole connect: 15 s for an unreachable host.)
+ *  - FreeRDP callbacks therefore run on the worker. Anything that touches
+ *    GTK is marshalled to the main thread with g_main_context_invoke().
+ *  - The framebuffer is guarded by frame_lock, held from BeginPaint to
+ *    EndPaint (and around gdi_init/resize/free); snapshot() copies it into an
+ *    immutable GdkTexture under the same lock.
+ *  - Input is sent from the main thread directly, as FreeRDP's SDL client
+ *    does; FreeRDP serialises transport writes with its own WriteLock.
+ *  - Certificate/authentication prompts block only the worker, on a
+ *    condition variable, until the application answers (Remmina's
+ *    ui_sync pattern). Upstream spun a nested main loop instead.
+ *  - Closing aborts the worker with freerdp_abort_connect_context(); the
+ *    context is freed on the main thread after the worker is joined.
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -27,7 +47,6 @@
 #include <freerdp/gdi/gfx.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cmdline.h>
-#include <freerdp/client/channels.h>
 #include <freerdp/client/rdpei.h>
 #include <freerdp/client/tsmf.h>
 #include <freerdp/client/rail.h>
@@ -42,41 +61,23 @@
 #include <gio/gio.h>
 #include <gtk/gtk.h>
 #include <math.h>
+#include <string.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include "frdp-session.h"
+#include "frdp-display-private.h"
 #include "frdp-context.h"
 #include "frdp-channel-display-control.h"
 #ifdef FRDP_WITH_CLIPBOARD
 #include "frdp-channel-clipboard.h"
 #endif
 
-#define SELECT_TIMEOUT 20
+/* The worker re-checks shall-disconnect at least this often. */
+#define FRDP_WORKER_WAIT_MS 100
 
-/* Spike instrumentation: FRDP_SPIKE_STATS=1 prints loop/frame rates every 5 s. */
-static struct { guint loops, timeouts, signaled, uploads; gint64 since; } spike_stats;
-
-static void
-spike_stats_tick (void)
-{
-  gint64 now = g_get_monotonic_time ();
-
-  if (spike_stats.since == 0)
-    spike_stats.since = now;
-  if (now - spike_stats.since >= 5 * G_USEC_PER_SEC) {
-    if (g_getenv ("FRDP_SPIKE_STATS") != NULL)
-      g_printerr ("frdp-stats: per 5s dispatches=%u unused=%u draws_queued=%u texture_uploads=%u\n",
-                  spike_stats.loops, spike_stats.timeouts, spike_stats.signaled, spike_stats.uploads);
-    memset (&spike_stats, 0, sizeof spike_stats);
-    spike_stats.since = now;
-  }
-}
-#define FRDP_CONNECTION_THREAD_MAX_ERRORS 10
-
-#ifdef HAVE_FREERDP3
 #define CONST_QUALIFIER const
-#else
-#define CONST_QUALIFIER
-#endif
 
 struct frdp_pointer
 {
@@ -85,44 +86,92 @@ struct frdp_pointer
 };
 typedef struct frdp_pointer frdpPointer;
 
+typedef enum
+{
+  FRDP_PROMPT_AUTHENTICATION,
+  FRDP_PROMPT_CERTIFICATE,
+  FRDP_PROMPT_CERTIFICATE_CHANGE,
+} FrdpPromptKind;
+
+typedef struct
+{
+  FrdpSession    *self;
+  FrdpPromptKind  kind;
+  gchar          *host;
+  guint16         port;
+  gchar          *common_name;
+  gchar          *subject;
+  gchar          *issuer;
+  gchar          *fingerprint;
+  gchar          *old_subject;
+  gchar          *old_issuer;
+  gchar          *old_fingerprint;
+  guint32         flags;
+} FrdpPromptRequest;
+
 struct _FrdpSessionPrivate
 {
+  /* Created on the main thread, owned by the worker while it runs, freed on
+   * the main thread after the worker has been joined. */
   freerdp      *freerdp_session;
+  GThread      *worker;
+  GTask        *connect_task;
+  gint          closing;            /* atomic */
+  gboolean      connect_ok;         /* written by worker before connect_done */
+  guint32       connect_error;      /* idem */
+  guint32       disconnect_error;   /* written by worker before worker_done */
 
-  GtkWidget    *display;
-  /* GTK4: the framebuffer is uploaded as an immutable texture per frame
-   * instead of wrapping gdi->primary_buffer in a cairo surface. */
-  GdkTexture   *frame;
-  gboolean      frame_dirty;
-  guint         resize_timeout_id;
+  /* ---- main thread only ---- */
+  GtkWidget    *display;            /* weak; cleared by FrdpDisplay on dispose */
+  gboolean      is_connected;
+  gboolean      scaling;
+  double        scale;
+  double        offset_x;
+  double        offset_y;
   int           alloc_width;
   int           alloc_height;
-  gboolean scaling;
-  double scale;
-  double offset_x;
-  double offset_y;
+  guint         resize_timeout_id;
+  gboolean      show_cursor;
+  gboolean      monitor_layout_supported;
+  GdkTexture   *frame;
+  gchar        *hostname;
+  gchar        *username;
+  gchar        *password;
+  gchar        *domain;
+  guint         port;
 
-  guint update_id;
-  guint close_idle_id;
+  /* ---- framebuffer: frame_lock ---- */
+  GMutex        frame_lock;
+  gboolean      paint_locked;       /* worker only: frame_lock held since BeginPaint */
+  gboolean      gdi_valid;
+  gboolean      frame_dirty;
+  guint         desktop_width;
+  guint         desktop_height;
+  gint          draw_scheduled;     /* atomic */
 
-  gboolean is_connected;
-
-  gchar *hostname;
-  gchar *username;
-  gchar *password;
-  gchar *domain;
-  guint  port;
-
-  gboolean show_cursor;
-  gboolean cursor_null;
-  frdpPointer *cursor;
-
-  /* Channels */
+  /* ---- cursor + channels: state_lock ---- */
+  GMutex        state_lock;
+  GdkTexture   *cursor_texture;
+  gint          cursor_x;
+  gint          cursor_y;
+  gboolean      cursor_null;
+  gint          cursor_scheduled;   /* atomic */
   FrdpChannelDisplayControl *display_control_channel;
 #ifdef FRDP_WITH_CLIPBOARD
   FrdpChannelClipboard      *clipboard_channel;
 #endif
-  gboolean                   monitor_layout_supported;
+
+  /* ---- prompts: prompt_lock ---- */
+  GMutex        prompt_lock;
+  GCond         prompt_cond;
+  gboolean      prompt_pending;
+  gboolean      prompt_answered;
+  guint         prompt_value;
+
+  /* spike instrumentation (FRDP_SPIKE_STATS=1) */
+  guint         stats_uploads;
+  guint         stats_draws;
+  gint64        stats_since;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (FrdpSession, frdp_session, G_TYPE_OBJECT)
@@ -152,32 +201,102 @@ enum
 
 static guint signals[LAST_SIGNAL];
 
+static void frdp_session_update_mouse_pointer (FrdpSession *self);
+
+/* ---- main-thread marshalling ------------------------------------------- */
+
+static gboolean
+frdp_session_in_main_thread (void)
+{
+  return g_main_context_is_owner (g_main_context_default ());
+}
+
+/* Runs @func(self) on the main thread (immediately if already there). */
+static void
+frdp_session_run_on_main (FrdpSession *self,
+                          GSourceFunc  func)
+{
+  g_main_context_invoke_full (NULL, G_PRIORITY_DEFAULT, func,
+                              g_object_ref (self), g_object_unref);
+}
+
+static gboolean
+frdp_session_draw_cb (gpointer user_data)
+{
+  FrdpSession        *self = user_data;
+  FrdpSessionPrivate *priv = self->priv;
+
+  g_atomic_int_set (&priv->draw_scheduled, 0);
+  priv->stats_draws++;
+
+  if (priv->display != NULL && priv->is_connected)
+    gtk_widget_queue_draw (priv->display);
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Coalesces redraw requests from the worker: at most one pending. */
+static void
+frdp_session_schedule_draw (FrdpSession *self)
+{
+  if (g_atomic_int_compare_and_exchange (&self->priv->draw_scheduled, 0, 1))
+    frdp_session_run_on_main (self, frdp_session_draw_cb);
+}
+
+static gboolean
+frdp_session_cursor_cb (gpointer user_data)
+{
+  FrdpSession *self = user_data;
+
+  g_atomic_int_set (&self->priv->cursor_scheduled, 0);
+  frdp_session_update_mouse_pointer (self);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+frdp_session_schedule_cursor_update (FrdpSession *self)
+{
+  if (g_atomic_int_compare_and_exchange (&self->priv->cursor_scheduled, 0, 1))
+    frdp_session_run_on_main (self, frdp_session_cursor_cb);
+}
+
+/* ---- pointer ------------------------------------------------------------ */
+
 static void
 frdp_session_update_mouse_pointer (FrdpSession  *self)
 {
   FrdpSessionPrivate *priv = self->priv;
-  GdkCursor *cursor;
+  GdkTexture *texture = NULL;
+  GdkCursor  *cursor;
+  gboolean    cursor_null;
+  gint        hot_x, hot_y;
 
   if (priv->display == NULL)
     return;
 
-  if (priv->show_cursor && priv->cursor_null) {
+  g_mutex_lock (&priv->state_lock);
+  if (priv->cursor_texture != NULL)
+    texture = g_object_ref (priv->cursor_texture);
+  cursor_null = priv->cursor_null;
+  hot_x = priv->cursor_x;
+  hot_y = priv->cursor_y;
+  g_mutex_unlock (&priv->state_lock);
+
+  if (priv->show_cursor && cursor_null) {
     /* Server hides the pointer. */
     cursor = gdk_cursor_new_from_name ("none", NULL);
-  } else if (!priv->show_cursor || !priv->cursor || !priv->cursor->texture) {
-    /* No cursor set or none to show */
+  } else if (!priv->show_cursor || texture == NULL) {
     cursor = gdk_cursor_new_from_name ("default", NULL);
   } else {
     /* GTK4 scales cursor textures for the surface scale itself; the
-     * remote-desktop scale factor is not applied here (spike scope). */
-    cursor = gdk_cursor_new_from_texture (priv->cursor->texture,
-                                          priv->cursor->pointer.xPos,
-                                          priv->cursor->pointer.yPos,
-                                          NULL);
+     * remote-desktop scale factor is not applied (known gap). */
+    cursor = gdk_cursor_new_from_texture (texture, hot_x, hot_y, NULL);
   }
 
   gtk_widget_set_cursor (priv->display, cursor);
   g_clear_object (&cursor);
+  g_clear_object (&texture);
 }
 
 static BOOL
@@ -230,18 +349,23 @@ frdp_pointer_free (rdpContext *context,
     g_clear_object (&fpointer->texture);
 }
 
+/* Pointer callbacks run on the worker: record the state, update on main. */
 static BOOL
 frdp_pointer_set (rdpContext *context,
                   rdpPointer *pointer)
 {
-  frdpContext *fcontext = (frdpContext *) context;
+  FrdpSession *self = ((frdpContext *) context)->self;
   frdpPointer *fpointer = (frdpPointer *) pointer;
-  FrdpSessionPrivate *priv = fcontext->self->priv;
+  FrdpSessionPrivate *priv = self->priv;
 
-  priv->cursor = fpointer;
+  g_mutex_lock (&priv->state_lock);
+  g_set_object (&priv->cursor_texture, fpointer->texture);
+  priv->cursor_x = pointer->xPos;
+  priv->cursor_y = pointer->yPos;
   priv->cursor_null = FALSE;
+  g_mutex_unlock (&priv->state_lock);
 
-  frdp_session_update_mouse_pointer (fcontext->self);
+  frdp_session_schedule_cursor_update (self);
 
   return TRUE;
 }
@@ -249,13 +373,15 @@ frdp_pointer_set (rdpContext *context,
 static BOOL
 frdp_pointer_set_null (rdpContext *context)
 {
-  frdpContext *fcontext = (frdpContext *) context;
-  FrdpSessionPrivate *priv = fcontext->self->priv;
+  FrdpSession *self = ((frdpContext *) context)->self;
+  FrdpSessionPrivate *priv = self->priv;
 
-  priv->cursor = NULL;
+  g_mutex_lock (&priv->state_lock);
+  g_clear_object (&priv->cursor_texture);
   priv->cursor_null = TRUE;
+  g_mutex_unlock (&priv->state_lock);
 
-  frdp_session_update_mouse_pointer (fcontext->self);
+  frdp_session_schedule_cursor_update (self);
 
   return TRUE;
 }
@@ -263,13 +389,15 @@ frdp_pointer_set_null (rdpContext *context)
 static BOOL
 frdp_pointer_set_default (rdpContext *context)
 {
-  frdpContext *fcontext = (frdpContext *) context;
-  FrdpSessionPrivate *priv = fcontext->self->priv;
+  FrdpSession *self = ((frdpContext *) context)->self;
+  FrdpSessionPrivate *priv = self->priv;
 
-  priv->cursor = NULL;
+  g_mutex_lock (&priv->state_lock);
+  g_clear_object (&priv->cursor_texture);
   priv->cursor_null = FALSE;
+  g_mutex_unlock (&priv->state_lock);
 
-  frdp_session_update_mouse_pointer (fcontext->self);
+  frdp_session_schedule_cursor_update (self);
 
   return TRUE;
 }
@@ -297,15 +425,17 @@ frdp_register_pointer (rdpGraphics *graphics)
   graphics_register_pointer (graphics, &pointer);
 }
 
-static rdpGdi *
-frdp_session_get_gdi (FrdpSession *self)
+/* ---- geometry (main thread) -------------------------------------------- */
+
+static void
+frdp_session_get_desktop_size (FrdpSession *self,
+                               guint       *width,
+                               guint       *height)
 {
-  FrdpSessionPrivate *priv = self->priv;
-
-  if (priv->freerdp_session == NULL || priv->freerdp_session->context == NULL)
-    return NULL;
-
-  return priv->freerdp_session->context->gdi;
+  g_mutex_lock (&self->priv->frame_lock);
+  *width = self->priv->gdi_valid ? self->priv->desktop_width : 0;
+  *height = self->priv->gdi_valid ? self->priv->desktop_height : 0;
+  g_mutex_unlock (&self->priv->frame_lock);
 }
 
 /* Scale/offset used both for drawing and for mapping pointer coordinates. */
@@ -313,77 +443,68 @@ static void
 frdp_session_update_scale (FrdpSession *self)
 {
   FrdpSessionPrivate *priv = self->priv;
-  rdpGdi             *gdi = frdp_session_get_gdi (self);
   double              width = priv->alloc_width, height = priv->alloc_height;
-  double              widget_ratio, server_ratio;
+  guint               dw, dh;
 
-  if (gdi == NULL || gdi->width == 0 || gdi->height == 0 || !priv->scaling ||
-      width <= 0 || height <= 0) {
+  frdp_session_get_desktop_size (self, &dw, &dh);
+
+  if (dw == 0 || dh == 0 || !priv->scaling || width <= 0 || height <= 0) {
     priv->scale = 1.0;
     priv->offset_x = priv->offset_y = 0.0;
     return;
   }
 
-  widget_ratio = width / height;
-  server_ratio = (double) gdi->width / gdi->height;
-
-  if (widget_ratio > server_ratio)
-    priv->scale = height / gdi->height;
+  if (width / height > (double) dw / dh)
+    priv->scale = height / dh;
   else
-    priv->scale = width / gdi->width;
+    priv->scale = width / dw;
 
-  priv->offset_x = (width - gdi->width * priv->scale) / 2.0;
-  priv->offset_y = (height - gdi->height * priv->scale) / 2.0;
+  priv->offset_x = (width - dw * priv->scale) / 2.0;
+  priv->offset_y = (height - dh * priv->scale) / 2.0;
 }
 
 static void
 frdp_session_update_size_request (FrdpSession *self)
 {
   FrdpSessionPrivate *priv = self->priv;
-  rdpGdi             *gdi = frdp_session_get_gdi (self);
   gboolean            allow_resize = FALSE;
+  guint               dw, dh;
 
   if (priv->display == NULL)
     return;
 
   g_object_get (G_OBJECT (priv->display), "allow-resize", &allow_resize, NULL);
+  frdp_session_get_desktop_size (self, &dw, &dh);
 
-  if (priv->scaling || allow_resize || gdi == NULL)
+  if (priv->scaling || allow_resize || dw == 0)
     gtk_widget_set_size_request (priv->display, -1, -1);
   else
-    gtk_widget_set_size_request (priv->display, gdi->width, gdi->height);
+    gtk_widget_set_size_request (priv->display, dw, dh);
 }
 
 static gboolean
-frdp_desktop_resize (rdpContext *context)
+frdp_session_geometry_changed_cb (gpointer user_data)
 {
-  FrdpSession *self = ((frdpContext *) context)->self;
-  rdpGdi      *gdi = context->gdi;
+  FrdpSession *self = user_data;
 
-  if (gdi_resize (gdi,
-                  freerdp_settings_get_uint32 (context->settings, FreeRDP_DesktopWidth),
-                  freerdp_settings_get_uint32 (context->settings, FreeRDP_DesktopHeight))) {
-    frdp_session_update_size_request (self);
-    frdp_session_update_scale (self);
-    self->priv->frame_dirty = TRUE;
-    return TRUE;
-  } else {
-    return FALSE;
-  }
+  frdp_session_update_size_request (self);
+  frdp_session_update_scale (self);
+  if (self->priv->display != NULL)
+    gtk_widget_queue_draw (self->priv->display);
+
+  return G_SOURCE_REMOVE;
 }
 
 static void
 frdp_session_request_remote_resize (FrdpSession *self)
 {
   FrdpSessionPrivate *priv = self->priv;
-  rdpSettings        *settings;
   guint32             request_width, request_height;
+  guint               dw, dh;
 
-  if (priv->freerdp_session == NULL || priv->display_control_channel == NULL ||
-      priv->alloc_width <= 0 || priv->alloc_height <= 0)
+  if (!priv->is_connected || priv->alloc_width <= 0 || priv->alloc_height <= 0)
     return;
 
-  settings = priv->freerdp_session->context->settings;
   request_width = priv->alloc_width;
   request_height = priv->alloc_height;
 
@@ -391,13 +512,18 @@ frdp_session_request_remote_resize (FrdpSession *self)
   if (request_width % 2 == 1)
     request_width--;
 
-  /* Only request resize if the rounded dimensions differ from the current
-   * desktop size; prevents resize loops with odd dimensions. */
-  if (freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth) != request_width ||
-      freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight) != request_height)
+  frdp_session_get_desktop_size (self, &dw, &dh);
+  if (dw == request_width && dh == request_height)
+    return;
+
+  /* Held across the call: the worker tears the channel down under the same
+   * lock when the dynamic channel disconnects. */
+  g_mutex_lock (&priv->state_lock);
+  if (priv->display_control_channel != NULL)
     frdp_channel_display_control_resize_display (priv->display_control_channel,
                                                  request_width,
                                                  request_height);
+  g_mutex_unlock (&priv->state_lock);
 }
 
 static gboolean
@@ -412,9 +538,8 @@ frdp_session_resize_timeout (gpointer user_data)
 }
 
 /* Replaces the GTK3 "configure-event" handler. Uses the widget's own
- * allocation instead of assuming a GtkScrolledWindow ancestor, and
- * debounces remote resizes so a window drag does not renegotiate the
- * monitor layout on every allocation. */
+ * allocation (upstream assumed a GtkScrolledWindow ancestor) and debounces
+ * remote resizes so a window drag does not renegotiate on every allocation. */
 void
 frdp_session_size_allocated (FrdpSession *self,
                              int          width,
@@ -428,7 +553,7 @@ frdp_session_size_allocated (FrdpSession *self,
 
   frdp_session_update_scale (self);
 
-  if (priv->display == NULL || priv->freerdp_session == NULL)
+  if (priv->display == NULL || !priv->is_connected)
     return;
 
   g_object_get (G_OBJECT (priv->display), "allow-resize", &allow_resize, NULL);
@@ -445,8 +570,8 @@ frdp_session_resize_supported_changed (FrdpDisplay *display,
                                        GParamSpec  *pspec,
                                        gpointer     user_data)
 {
-  FrdpSession        *self = user_data;
-  gboolean            resize_supported, allow_resize;
+  FrdpSession *self = user_data;
+  gboolean     resize_supported, allow_resize;
 
   g_object_get (G_OBJECT (display),
                 "resize-supported", &resize_supported,
@@ -466,10 +591,27 @@ frdp_session_set_scaling (FrdpSession *self,
   frdp_session_update_size_request (self);
 }
 
-/* Replaces the GTK3 "draw" handler. The framebuffer is copied into an
- * immutable GdkMemoryTexture at most once per frame (only when FreeRDP
- * painted since the last one), so GTK never reads a buffer FreeRDP is
- * writing. */
+/* ---- framebuffer ---------------------------------------------------------- */
+
+static void
+frdp_session_stats (FrdpSession *self)
+{
+  FrdpSessionPrivate *priv = self->priv;
+  gint64              now = g_get_monotonic_time ();
+
+  if (priv->stats_since == 0)
+    priv->stats_since = now;
+  if (now - priv->stats_since < 5 * G_USEC_PER_SEC)
+    return;
+  if (g_getenv ("FRDP_SPIKE_STATS") != NULL)
+    g_printerr ("frdp-stats: per 5s main-thread draws=%u texture_uploads=%u\n",
+                priv->stats_draws, priv->stats_uploads);
+  priv->stats_draws = priv->stats_uploads = 0;
+  priv->stats_since = now;
+}
+
+/* Main thread. Copies the framebuffer into an immutable GdkMemoryTexture
+ * (under frame_lock, only when FreeRDP painted since the last copy). */
 void
 frdp_session_snapshot (FrdpSession *self,
                        GtkSnapshot *snapshot,
@@ -477,122 +619,325 @@ frdp_session_snapshot (FrdpSession *self,
                        int          height)
 {
   FrdpSessionPrivate *priv = self->priv;
-  rdpGdi             *gdi = frdp_session_get_gdi (self);
+  rdpGdi             *gdi;
+  guint               dw = 0, dh = 0;
 
-  if (!priv->is_connected || gdi == NULL || gdi->primary_buffer == NULL)
+  if (!priv->is_connected || priv->freerdp_session == NULL)
     return;
 
-  if (priv->frame == NULL || priv->frame_dirty ||
-      gdk_texture_get_width (priv->frame) != (int) gdi->width ||
-      gdk_texture_get_height (priv->frame) != (int) gdi->height) {
-    GBytes *bytes = g_bytes_new (gdi->primary_buffer, (gsize) gdi->stride * gdi->height);
+  g_mutex_lock (&priv->frame_lock);
+  gdi = priv->freerdp_session->context->gdi;
+  if (priv->gdi_valid && gdi != NULL && gdi->primary_buffer != NULL) {
+    dw = gdi->width;
+    dh = gdi->height;
+    if (priv->frame == NULL || priv->frame_dirty ||
+        gdk_texture_get_width (priv->frame) != (int) dw ||
+        gdk_texture_get_height (priv->frame) != (int) dh) {
+      GBytes *bytes = g_bytes_new (gdi->primary_buffer, (gsize) gdi->stride * dh);
 
-    g_clear_object (&priv->frame);
-    spike_stats.uploads++;
-    priv->frame = gdk_memory_texture_new (gdi->width, gdi->height,
-                                          GDK_MEMORY_B8G8R8X8,
-                                          bytes, gdi->stride);
-    g_bytes_unref (bytes);
-    priv->frame_dirty = FALSE;
+      g_clear_object (&priv->frame);
+      priv->frame = gdk_memory_texture_new (dw, dh, GDK_MEMORY_B8G8R8X8, bytes, gdi->stride);
+      g_bytes_unref (bytes);
+      priv->frame_dirty = FALSE;
+      priv->stats_uploads++;
+    }
   }
+  g_mutex_unlock (&priv->frame_lock);
+
+  frdp_session_stats (self);
+
+  if (priv->frame == NULL)
+    return;
+
+  dw = gdk_texture_get_width (priv->frame);
+  dh = gdk_texture_get_height (priv->frame);
 
   if (priv->scaling) {
     graphene_rect_t rect = GRAPHENE_RECT_INIT (priv->offset_x, priv->offset_y,
-                                               gdi->width * priv->scale,
-                                               gdi->height * priv->scale);
+                                               dw * priv->scale, dh * priv->scale);
     gtk_snapshot_append_scaled_texture (snapshot, priv->frame,
                                         GSK_SCALING_FILTER_LINEAR, &rect);
   } else {
-    graphene_rect_t rect = GRAPHENE_RECT_INIT (0, 0, gdi->width, gdi->height);
+    graphene_rect_t rect = GRAPHENE_RECT_INIT (0, 0, dw, dh);
     gtk_snapshot_append_texture (snapshot, priv->frame, &rect);
   }
+}
+
+/* Worker. frame_lock is held from BeginPaint to EndPaint so the main thread
+ * never copies a half-painted frame. */
+static gboolean
+frdp_begin_paint (rdpContext *context)
+{
+  FrdpSessionPrivate *priv = ((frdpContext *) context)->self->priv;
+  rdpGdi *gdi = context->gdi;
+
+  if (!priv->paint_locked) {
+    g_mutex_lock (&priv->frame_lock);
+    priv->paint_locked = TRUE;
+  }
+
+  gdi->primary->hdc->hwnd->invalid->null = 1;
+  gdi->primary->hdc->hwnd->ninvalid = 0;
+
+  return TRUE;
+}
+
+static gboolean
+frdp_end_paint (rdpContext *context)
+{
+  FrdpSession        *self = ((frdpContext *) context)->self;
+  FrdpSessionPrivate *priv = self->priv;
+  rdpGdi             *gdi = context->gdi;
+  gboolean            painted = !gdi->primary->hdc->hwnd->invalid->null;
+
+  if (painted)
+    priv->frame_dirty = TRUE;
+
+  if (priv->paint_locked) {
+    priv->paint_locked = FALSE;
+    g_mutex_unlock (&priv->frame_lock);
+  }
+
+  if (painted)
+    frdp_session_schedule_draw (self);
+
+  return TRUE;
+}
+
+/* Worker. */
+static gboolean
+frdp_desktop_resize (rdpContext *context)
+{
+  FrdpSession        *self = ((frdpContext *) context)->self;
+  FrdpSessionPrivate *priv = self->priv;
+  rdpGdi             *gdi = context->gdi;
+  gboolean            took_lock = !priv->paint_locked;
+  gboolean            ok;
+
+  if (took_lock)
+    g_mutex_lock (&priv->frame_lock);
+
+  ok = gdi_resize (gdi,
+                   freerdp_settings_get_uint32 (context->settings, FreeRDP_DesktopWidth),
+                   freerdp_settings_get_uint32 (context->settings, FreeRDP_DesktopHeight));
+  if (ok) {
+    priv->desktop_width = gdi->width;
+    priv->desktop_height = gdi->height;
+    priv->frame_dirty = TRUE;
+  }
+
+  if (took_lock)
+    g_mutex_unlock (&priv->frame_lock);
+
+  if (ok) {
+    frdp_session_run_on_main (self, frdp_session_geometry_changed_cb);
+    frdp_session_schedule_draw (self);
+  }
+
+  return ok;
+}
+
+/* ---- prompts (worker blocks, main answers) ------------------------------ */
+
+static void
+frdp_prompt_request_free (gpointer data)
+{
+  FrdpPromptRequest *req = data;
+
+  g_object_unref (req->self);
+  g_free (req->host);
+  g_free (req->common_name);
+  g_free (req->subject);
+  g_free (req->issuer);
+  g_free (req->fingerprint);
+  g_free (req->old_subject);
+  g_free (req->old_issuer);
+  g_free (req->old_fingerprint);
+  g_free (req);
+}
+
+static gboolean
+frdp_prompt_on_main (gpointer data)
+{
+  FrdpPromptRequest  *req = data;
+  FrdpSession        *self = req->self;
+  FrdpSessionPrivate *priv = self->priv;
+
+  if (g_atomic_int_get (&priv->closing) || priv->display == NULL) {
+    frdp_session_answer_prompt (self, 0);
+    return G_SOURCE_REMOVE;
+  }
+
+  switch (req->kind) {
+  case FRDP_PROMPT_AUTHENTICATION:
+    _frdp_display_request_authentication (FRDP_DISPLAY (priv->display));
+    break;
+  case FRDP_PROMPT_CERTIFICATE:
+    _frdp_display_request_certificate_verification (FRDP_DISPLAY (priv->display),
+                                                    req->host, req->port,
+                                                    req->common_name, req->subject,
+                                                    req->issuer, req->fingerprint,
+                                                    req->flags);
+    break;
+  case FRDP_PROMPT_CERTIFICATE_CHANGE:
+    _frdp_display_request_certificate_change_verification (FRDP_DISPLAY (priv->display),
+                                                           req->host, req->port,
+                                                           req->common_name, req->subject,
+                                                           req->issuer, req->fingerprint,
+                                                           req->old_subject, req->old_issuer,
+                                                           req->old_fingerprint, req->flags);
+    break;
+  }
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Worker: hands @req to the main thread and sleeps until it is answered or
+ * the session is closed (then 0 = refuse). Takes ownership of @req. */
+static guint
+frdp_session_prompt (FrdpSession       *self,
+                     FrdpPromptRequest *req)
+{
+  FrdpSessionPrivate *priv = self->priv;
+  guint               value;
+
+  g_mutex_lock (&priv->prompt_lock);
+  priv->prompt_pending = TRUE;
+  priv->prompt_answered = FALSE;
+  priv->prompt_value = 0;
+  g_mutex_unlock (&priv->prompt_lock);
+
+  req->self = g_object_ref (self);
+  g_main_context_invoke_full (NULL, G_PRIORITY_DEFAULT,
+                              frdp_prompt_on_main, req, frdp_prompt_request_free);
+
+  g_mutex_lock (&priv->prompt_lock);
+  while (!priv->prompt_answered && !g_atomic_int_get (&priv->closing))
+    g_cond_wait (&priv->prompt_cond, &priv->prompt_lock);
+  value = priv->prompt_answered ? priv->prompt_value : 0;
+  priv->prompt_pending = FALSE;
+  g_mutex_unlock (&priv->prompt_lock);
+
+  return value;
+}
+
+void
+frdp_session_answer_prompt (FrdpSession *self,
+                            guint        value)
+{
+  FrdpSessionPrivate *priv = self->priv;
+
+  g_mutex_lock (&priv->prompt_lock);
+  if (priv->prompt_pending && !priv->prompt_answered) {
+    priv->prompt_value = value;
+    priv->prompt_answered = TRUE;
+    g_cond_broadcast (&priv->prompt_cond);
+  }
+  g_mutex_unlock (&priv->prompt_lock);
 }
 
 /*
  * Return 1 to accept and store a certificate, 2 to accept
  * a certificate only for this session, 0 otherwise.
  */
-static guint
+static DWORD
 frdp_certificate_verify_ex (freerdp     *freerdp_session,
-                            const gchar *host,
-                            guint16      port,
-                            const gchar *common_name,
-                            const gchar *subject,
-                            const gchar *issuer,
-                            const gchar *fingerprint,
-                            guint32      flags)
+                            const char  *host,
+                            UINT16       port,
+                            const char  *common_name,
+                            const char  *subject,
+                            const char  *issuer,
+                            const char  *fingerprint,
+                            DWORD        flags)
 {
-  FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
+  FrdpSession       *self = ((frdpContext *) freerdp_session->context)->self;
+  FrdpPromptRequest *req = g_new0 (FrdpPromptRequest, 1);
 
-  if (self->priv->display == NULL)
-    return 0; /* widget gone: refuse */
+  req->kind = FRDP_PROMPT_CERTIFICATE;
+  req->host = g_strdup (host);
+  req->port = port;
+  req->common_name = g_strdup (common_name);
+  req->subject = g_strdup (subject);
+  req->issuer = g_strdup (issuer);
+  req->fingerprint = g_strdup (fingerprint);
+  req->flags = flags;
 
-  return frdp_display_certificate_verify_ex (FRDP_DISPLAY (self->priv->display),
-                                             host,
-                                             port,
-                                             common_name,
-                                             subject,
-                                             issuer,
-                                             fingerprint,
-                                             flags);
+  return frdp_session_prompt (self, req);
 }
 
-static guint
+static DWORD
 frdp_changed_certificate_verify_ex (freerdp     *freerdp_session,
-                                    const gchar *host,
-                                    guint16      port,
-                                    const gchar *common_name,
-                                    const gchar *subject,
-                                    const gchar *issuer,
-                                    const gchar *fingerprint,
-                                    const gchar *old_subject,
-                                    const gchar *old_issuer,
-                                    const gchar *old_fingerprint,
-                                    guint32      flags)
+                                    const char  *host,
+                                    UINT16       port,
+                                    const char  *common_name,
+                                    const char  *subject,
+                                    const char  *issuer,
+                                    const char  *fingerprint,
+                                    const char  *old_subject,
+                                    const char  *old_issuer,
+                                    const char  *old_fingerprint,
+                                    DWORD        flags)
 {
-  FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
+  FrdpSession       *self = ((frdpContext *) freerdp_session->context)->self;
+  FrdpPromptRequest *req = g_new0 (FrdpPromptRequest, 1);
 
-  if (self->priv->display == NULL)
-    return 0; /* widget gone: refuse */
+  req->kind = FRDP_PROMPT_CERTIFICATE_CHANGE;
+  req->host = g_strdup (host);
+  req->port = port;
+  req->common_name = g_strdup (common_name);
+  req->subject = g_strdup (subject);
+  req->issuer = g_strdup (issuer);
+  req->fingerprint = g_strdup (fingerprint);
+  req->old_subject = g_strdup (old_subject);
+  req->old_issuer = g_strdup (old_issuer);
+  req->old_fingerprint = g_strdup (old_fingerprint);
+  req->flags = flags;
 
-  return frdp_display_certificate_change_verify_ex (FRDP_DISPLAY (self->priv->display),
-                                                    host,
-                                                    port,
-                                                    common_name,
-                                                    subject,
-                                                    issuer,
-                                                    fingerprint,
-                                                    old_subject,
-                                                    old_issuer,
-                                                    old_fingerprint,
-                                                    flags);
+  return frdp_session_prompt (self, req);
 }
 
-static gboolean
+static BOOL
 frdp_authenticate_ex (freerdp          *freerdp_session,
-                      gchar           **username,
-                      gchar           **password,
-                      gchar           **domain,
+                      char            **username,
+                      char            **password,
+                      char            **domain,
                       rdp_auth_reason   reason)
 {
-  FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
+  FrdpSession       *self = ((frdpContext *) freerdp_session->context)->self;
+  FrdpPromptRequest *req = g_new0 (FrdpPromptRequest, 1);
 
-  if (self->priv->display == NULL)
-    return 0; /* widget gone: refuse */
+  req->kind = FRDP_PROMPT_AUTHENTICATION;
+  if (frdp_session_prompt (self, req) == 0)
+    return FALSE;
 
-  return frdp_display_authenticate (FRDP_DISPLAY (self->priv->display),
-                                    username,
-                                    password,
-                                    domain);
+  /* The main thread stored the answer before waking us (prompt_lock gives
+   * the ordering). GLib allocates with malloc, so FreeRDP may free() these. */
+  *username = *password = *domain = NULL;
+  g_object_get (self,
+                "username", username,
+                "password", password,
+                "domain", domain,
+                NULL);
+
+  return TRUE;
+}
+
+/* ---- channels (worker) ----------------------------------------------------- */
+
+static gboolean
+frdp_session_caps_set_cb (gpointer user_data)
+{
+  g_object_set (G_OBJECT (user_data), "monitor-layout-supported", TRUE, NULL);
+
+  return G_SOURCE_REMOVE;
 }
 
 static void
 caps_set (FrdpChannelDisplayControl *channel,
           gpointer                   user_data)
 {
-  FrdpSession *session = user_data;
-
-  g_object_set (G_OBJECT (session), "monitor-layout-supported", TRUE, NULL);
+  /* Can fire on the worker; property notifications reach GTK. */
+  frdp_session_run_on_main (FRDP_SESSION (user_data), frdp_session_caps_set_cb);
 }
 
 static void
@@ -606,13 +951,14 @@ frdp_on_channel_connected_event_handler (void                                   
   if (strcmp (e->name, RDPEI_DVC_CHANNEL_NAME) == 0) {
     // TODO Touch input redirection
   } else if (strcmp (e->name, DISP_DVC_CHANNEL_NAME) == 0) {
+    g_mutex_lock (&priv->state_lock);
     g_clear_object (&priv->display_control_channel);
-
     priv->display_control_channel = g_object_new (FRDP_TYPE_CHANNEL_DISPLAY_CONTROL,
                                                   "session", session,
                                                   "display-client-context", (DispClientContext *) e->pInterface,
                                                   NULL);
     g_signal_connect (priv->display_control_channel, "caps-set", G_CALLBACK (caps_set), session);
+    g_mutex_unlock (&priv->state_lock);
   } else if (strcmp (e->name, TSMF_DVC_CHANNEL_NAME) == 0) {
     // TODO Old windows 7 multimedia redirection
   } else if (strcmp (e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
@@ -621,12 +967,13 @@ frdp_on_channel_connected_event_handler (void                                   
     // TODO Remote application
   } else if (strcmp (e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
 #ifdef FRDP_WITH_CLIPBOARD
+    g_mutex_lock (&priv->state_lock);
     g_clear_object (&priv->clipboard_channel);
-
     priv->clipboard_channel = g_object_new (FRDP_TYPE_CHANNEL_CLIPBOARD,
                                             "session", session,
                                             "cliprdr-client-context", (CliprdrClientContext *) e->pInterface,
                                             NULL);
+    g_mutex_unlock (&priv->state_lock);
 #endif
   } else if (strcmp (e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0) {
     // TODO Multiparty channel
@@ -647,22 +994,18 @@ frdp_on_channel_disconnected_event_handler (void                                
   FrdpSession        *session = ctx->self;
   FrdpSessionPrivate *priv = frdp_session_get_instance_private (session);
 
-  if (strcmp (e->name, RDPEI_DVC_CHANNEL_NAME) == 0) {
-    // TODO Touch input redirection
-  } else if (strcmp (e->name, DISP_DVC_CHANNEL_NAME) == 0) {
+  if (strcmp (e->name, DISP_DVC_CHANNEL_NAME) == 0) {
+    g_mutex_lock (&priv->state_lock);
     g_clear_object (&priv->display_control_channel);
-  } else if (strcmp (e->name, TSMF_DVC_CHANNEL_NAME) == 0) {
-    // TODO Old windows 7 multimedia redirection
+    g_mutex_unlock (&priv->state_lock);
   } else if (strcmp (e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
     gdi_graphics_pipeline_uninit (ctx->context.gdi, (RdpgfxClientContext *) e->pInterface);
-  } else if (strcmp (e->name, RAIL_SVC_CHANNEL_NAME) == 0) {
-    // TODO Remote application
   } else if (strcmp (e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
 #ifdef FRDP_WITH_CLIPBOARD
+    g_mutex_lock (&priv->state_lock);
     g_clear_object (&priv->clipboard_channel);
+    g_mutex_unlock (&priv->state_lock);
 #endif
-  } else if (strcmp (e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0) {
-    // TODO Multiparty channel
   } else if (strcmp (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
     gdi_video_geometry_uninit (ctx->context.gdi, (GeometryClientContext *) e->pInterface);
   } else if (strcmp (e->name, VIDEO_CONTROL_DVC_CHANNEL_NAME) == 0) {
@@ -727,79 +1070,56 @@ frdp_pre_connect (freerdp *freerdp_session)
 #endif
 }
 
-static gboolean
-frdp_begin_paint (rdpContext *context)
-{
-  rdpGdi *gdi = context->gdi;
-
-  gdi->primary->hdc->hwnd->invalid->null = 1;
-  gdi->primary->hdc->hwnd->ninvalid = 0;
-
-  return TRUE;
-}
-
-/* GTK4 has no partial invalidation; FreeRDP's GDI already tracks the dirty
- * region, so a flag that makes the next snapshot re-upload is enough. */
-static gboolean
-frdp_end_paint (rdpContext *context)
-{
-  FrdpSession *self = ((frdpContext *) context)->self;
-  rdpGdi *gdi = context->gdi;
-
-  if (gdi->primary->hdc->hwnd->invalid->null)
-    return TRUE;
-
-  self->priv->frame_dirty = TRUE;
-
-  return TRUE;
-}
-
+/* Worker. */
 static gboolean
 frdp_post_connect (freerdp *freerdp_session)
 {
-  rdpSettings *settings;
-  rdpContext *context;
-  FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
+  rdpContext         *context = freerdp_session->context;
+  rdpSettings        *settings = context->settings;
+  FrdpSession        *self = ((frdpContext *) context)->self;
+  FrdpSessionPrivate *priv = self->priv;
   ResizeWindowEventArgs e;
 
-  context = freerdp_session->context;
-  settings = context->settings;
-
+  g_mutex_lock (&priv->frame_lock);
   /* GTK4 has no visuals to probe; GdkMemoryTexture takes 32-bit BGRX. */
-  gdi_init (freerdp_session, PIXEL_FORMAT_BGRX32);
+  if (!gdi_init (freerdp_session, PIXEL_FORMAT_BGRX32)) {
+    g_mutex_unlock (&priv->frame_lock);
+    return FALSE;
+  }
+  priv->gdi_valid = TRUE;
+  priv->desktop_width = context->gdi->width;
+  priv->desktop_height = context->gdi->height;
+  priv->frame_dirty = TRUE;
+  g_mutex_unlock (&priv->frame_lock);
 
-  frdp_register_pointer (freerdp_session->context->graphics);
-  freerdp_session->context->update->BeginPaint = frdp_begin_paint;
-  freerdp_session->context->update->EndPaint = frdp_end_paint;
-  freerdp_session->context->update->DesktopResize = frdp_desktop_resize;
+  frdp_register_pointer (context->graphics);
+  context->update->BeginPaint = frdp_begin_paint;
+  context->update->EndPaint = frdp_end_paint;
+  context->update->DesktopResize = frdp_desktop_resize;
 
-  EventArgsInit(&e, "frdp");
-	e.width = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth);
-	e.height = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
-	PubSub_OnResizeWindow(context->pubSub, freerdp_session->context, &e);
-
-  frdp_session_update_size_request (self);
-  frdp_session_update_scale (self);
-  self->priv->frame_dirty = TRUE;
+  EventArgsInit (&e, "frdp");
+  e.width = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth);
+  e.height = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
+  PubSub_OnResizeWindow (context->pubSub, context, &e);
 
   return TRUE;
 }
 
+/* Worker (inside freerdp_disconnect). */
 static void
 frdp_post_disconnect (freerdp *instance)
 {
-  FrdpSession *self;
-  rdpContext  *context;
+  FrdpSession        *self;
+  FrdpSessionPrivate *priv;
+  rdpContext         *context;
 
   if (!instance || !instance->context)
     return;
 
-  self = ((frdpContext *) instance->context)->self;
-
-  if (self->priv->display != NULL)
-    g_signal_handlers_disconnect_by_func (self->priv->display, G_CALLBACK (frdp_session_resize_supported_changed), self);
-
   context = instance->context;
+  self = ((frdpContext *) context)->self;
+  priv = self->priv;
+
   PubSub_UnsubscribeChannelConnected (context->pubSub,
                                       frdp_on_channel_connected_event_handler);
   PubSub_UnsubscribeChannelDisconnected (context->pubSub,
@@ -807,258 +1127,10 @@ frdp_post_disconnect (freerdp *instance)
 
   frdp_pointer_set_null (context);
 
+  g_mutex_lock (&priv->frame_lock);
+  priv->gdi_valid = FALSE;
   gdi_free (instance);
-}
-
-static gboolean
-idle_close (gpointer user_data)
-{
-  FrdpSession *self = (FrdpSession*) user_data;
-
-  gboolean was_open = self->priv->is_connected || self->priv->freerdp_session != NULL;
-
-  if (self->priv->close_idle_id != 0) {
-    guint id = self->priv->close_idle_id;
-
-    /* Removing it drops the idle's reference; we are not the last holder
-     * (finalize cannot run while the idle still owns one). */
-    self->priv->close_idle_id = 0;
-    g_source_remove (id);
-  }
-
-  self->priv->is_connected = FALSE;
-
-  if (self->priv->update_id > 0) {
-    g_source_remove (self->priv->update_id);
-    self->priv->update_id = 0;
-  }
-
-  if (self->priv->resize_timeout_id > 0) {
-    g_source_remove (self->priv->resize_timeout_id);
-    self->priv->resize_timeout_id = 0;
-  }
-
-  if (self->priv->freerdp_session != NULL) {
-    freerdp_disconnect (self->priv->freerdp_session);
-    /* freerdp_free() only frees the instance struct (verified in FreeRDP
-     * 3.32.1 libfreerdp/core/freerdp.c); upstream never freed the context,
-     * leaking settings, channels and the GDI framebuffer per session. */
-    if (self->priv->freerdp_session->context != NULL)
-      freerdp_context_free (self->priv->freerdp_session);
-    g_clear_pointer (&self->priv->freerdp_session, freerdp_free);
-  }
-
-  g_clear_object (&self->priv->frame);
-  self->priv->frame_dirty = FALSE;
-  self->priv->cursor = NULL;
-
-  if (self->priv->display != NULL)
-    gtk_widget_queue_draw (self->priv->display);
-
-  /* Idempotent: dispose, an explicit close and a server disconnect can all
-   * land here; only the first one is a state change worth announcing. */
-  if (!was_open)
-    return FALSE;
-
-  g_signal_emit (self, signals[RDP_DISCONNECTED], 0);
-  g_debug ("RDP client disconnected");
-
-  return FALSE;
-}
-
-static gboolean
-idle_close_cb (gpointer user_data)
-{
-  FrdpSession *self = user_data;
-
-  self->priv->close_idle_id = 0;
-  idle_close (self);
-
-  return G_SOURCE_REMOVE;
-}
-
-/* Upstream queued idle_close() with a bare pointer. Once the widget (and
- * with it the session) is actually freed, the queued close ran on freed
- * memory: Gtk-CRITICAL + free(): invalid pointer after a failed connect.
- * The idle now owns a reference, and only one close is ever pending. */
-static void
-frdp_session_schedule_close (FrdpSession *self)
-{
-  if (self->priv->close_idle_id != 0)
-    return;
-
-  self->priv->close_idle_id = g_idle_add_full (G_PRIORITY_DEFAULT_IDLE,
-                                               idle_close_cb,
-                                               g_object_ref (self),
-                                               g_object_unref);
-}
-
-/*
- * FreeRDP event source.
- *
- * Upstream ran an idle callback that blocked the GTK thread in
- * WaitForMultipleObjects() for up to 20 ms per iteration: ~50 wake-ups/s
- * and ~7% of a core while the remote desktop was completely idle, plus up
- * to 20 ms of input latency. This GSource instead hands FreeRDP's handles
- * to the GLib main loop, which sleeps until one is ready:
- *  - Unix/macOS: winpr_Handle_getFd() gives a pollable fd for each handle
- *  - Windows: g_poll() waits on HANDLEs directly (GPollFD.fd is a HANDLE)
- * Handles that have no fd fall back to a short poll timeout.
- */
-#define FRDP_MAX_HANDLES 64
-#define FRDP_FALLBACK_POLL_MS 20
-
-typedef struct
-{
-  GSource      source;
-  FrdpSession *self;
-  GPollFD      fds[FRDP_MAX_HANDLES];
-  guint        n_fds;
-  gboolean     needs_fallback_poll;
-} FrdpEventSource;
-
-/* Re-registers poll fds only when FreeRDP's handle set actually changed.
- * Changing a source's polls makes GLib discard the current iteration and
- * start over without sleeping, so touching them on every prepare() spins
- * a full core (measured). */
-static void
-frdp_event_source_refresh (FrdpEventSource *src)
-{
-  FrdpSessionPrivate *priv = src->self->priv;
-  HANDLE              handles[FRDP_MAX_HANDLES];
-  gintptr             fds[FRDP_MAX_HANDLES];
-  guint               n_new = 0;
-  gboolean            fallback = FALSE;
-  DWORD               n = 0, i;
-
-  if (priv->freerdp_session != NULL)
-    n = freerdp_get_event_handles (priv->freerdp_session->context, handles, ARRAYSIZE (handles));
-  if (n == 0)
-    fallback = TRUE;
-
-  for (i = 0; i < n; i++) {
-#ifdef G_OS_WIN32
-    gintptr fd = (gintptr) handles[i];
-#else
-    gintptr fd = GetEventFileDescriptor (handles[i]);
-#endif
-    if (fd < 0)
-      fallback = TRUE;
-    else
-      fds[n_new++] = fd;
-  }
-
-  src->needs_fallback_poll = fallback;
-
-  if (n_new == src->n_fds) {
-    gboolean same = TRUE;
-
-    for (i = 0; i < n_new && same; i++)
-      same = (src->fds[i].fd == fds[i]);
-    if (same)
-      return;
-  }
-
-  for (i = 0; i < src->n_fds; i++)
-    g_source_remove_poll (&src->source, &src->fds[i]);
-
-  for (i = 0; i < n_new; i++) {
-    src->fds[i].fd = fds[i];
-    src->fds[i].events = G_IO_IN | G_IO_HUP | G_IO_ERR;
-    src->fds[i].revents = 0;
-    g_source_add_poll (&src->source, &src->fds[i]);
-  }
-  src->n_fds = n_new;
-}
-
-static gboolean
-frdp_event_source_prepare (GSource *source, gint *timeout)
-{
-  FrdpEventSource *src = (FrdpEventSource *) source;
-
-  /* The handle set changes as channels come and go; re-read it each cycle.
-   * It is a handful of handles, so this is cheap. */
-  frdp_event_source_refresh (src);
-  *timeout = src->needs_fallback_poll ? FRDP_FALLBACK_POLL_MS : -1;
-
-  /* Never "ready" just because a frame is dirty: frames only become dirty
-   * inside dispatch (FreeRDP paints during freerdp_check_event_handles),
-   * which queues the draw itself, and GTK snapshots on map anyway.
-   * Reporting dirty here would spin until the next frame clock tick. */
-  return FALSE;
-}
-
-static gboolean
-frdp_event_source_check (GSource *source)
-{
-  FrdpEventSource *src = (FrdpEventSource *) source;
-  guint            i;
-
-  if (src->needs_fallback_poll)
-    return TRUE;
-
-  for (i = 0; i < src->n_fds; i++)
-    if (src->fds[i].revents != 0)
-      return TRUE;
-
-  return FALSE;
-}
-
-static gboolean
-frdp_event_source_dispatch (GSource *source, GSourceFunc callback, gpointer user_data)
-{
-  FrdpEventSource    *src = (FrdpEventSource *) source;
-  FrdpSession        *self = src->self;
-  FrdpSessionPrivate *priv = self->priv;
-
-  spike_stats.loops++;
-  spike_stats_tick ();
-
-  if (priv->freerdp_session == NULL)
-    return G_SOURCE_REMOVE;
-
-  if (!freerdp_check_event_handles (priv->freerdp_session->context) &&
-      freerdp_get_last_error (priv->freerdp_session->context) == FREERDP_ERROR_SUCCESS)
-    g_warning ("Failed to check FreeRDP event handles");
-
-  if (freerdp_shall_disconnect_context (priv->freerdp_session->context)) {
-    priv->update_id = 0;
-    frdp_session_schedule_close (self);
-    return G_SOURCE_REMOVE;
-  }
-
-  /* Upstream skipped all processing while the widget was unmapped, which
-   * would stall the connection of a hidden (background) tab. Only drawing
-   * is skipped now; the frame stays dirty until the widget is shown. */
-  if (priv->frame_dirty && priv->display != NULL && gtk_widget_get_mapped (priv->display)) {
-    spike_stats.signaled++;
-    gtk_widget_queue_draw (priv->display);
-  }
-
-  return G_SOURCE_CONTINUE;
-}
-
-static GSourceFuncs frdp_event_source_funcs = {
-  frdp_event_source_prepare,
-  frdp_event_source_check,
-  frdp_event_source_dispatch,
-  NULL, NULL, NULL
-};
-
-static guint
-frdp_session_attach_event_source (FrdpSession *self)
-{
-  GSource         *source = g_source_new (&frdp_event_source_funcs, sizeof (FrdpEventSource));
-  FrdpEventSource *src = (FrdpEventSource *) source;
-  guint            id;
-
-  src->self = self;
-  src->n_fds = 0;
-  g_source_set_name (source, "FreeRDP events");
-  id = g_source_attach (source, NULL);
-  g_source_unref (source);
-
-  return id;
+  g_mutex_unlock (&priv->frame_lock);
 }
 
 /*
@@ -1348,85 +1420,191 @@ frdp_session_init_freerdp (FrdpSession *self)
   return TRUE;
 }
 
-static void
-frdp_session_connect_thread (GTask        *task,
-                             gpointer      source_object,
-                             gpointer      task_data,
-                             GCancellable *cancellable)
+/* ---- session thread --------------------------------------------------------- */
+
+static gboolean frdp_session_connect_done_cb (gpointer user_data);
+static gboolean frdp_session_worker_done_cb (gpointer user_data);
+
+static gpointer
+frdp_session_worker (gpointer data)
 {
-  FrdpSession *self = (FrdpSession*) source_object;
-  guint32      error_code;
+  FrdpSession        *self = data;
+  FrdpSessionPrivate *priv = self->priv;
+  freerdp            *instance = priv->freerdp_session;
+  rdpContext         *context = instance->context;
 
-  if (!frdp_session_init_freerdp (self)) {
-    if (self->priv->freerdp_session != NULL &&
-        self->priv->freerdp_session->context != NULL) {
-      error_code = freerdp_get_last_error (self->priv->freerdp_session->context);
-      g_signal_emit (self,
-                     signals[RDP_ERROR], 0,
-                     freerdp_get_last_error_string (error_code));
-      g_warning ("Failed to initialize RDP with error '%s'",
-                 freerdp_get_last_error_string (error_code));
-    } else {
-      g_signal_emit (self,
-                     signals[RDP_ERROR], 0,
-                     "Failed to initialize RDP!");
+  priv->connect_ok = freerdp_connect (instance);
+  priv->connect_error = priv->connect_ok ? FREERDP_ERROR_SUCCESS
+                                         : freerdp_get_last_error (context);
+  frdp_session_run_on_main (self, frdp_session_connect_done_cb);
+
+  while (priv->connect_ok && !freerdp_shall_disconnect_context (context)) {
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+    DWORD  n, status;
+
+    n = freerdp_get_event_handles (context, handles, ARRAYSIZE (handles));
+    if (n == 0) {
+      g_warning ("Failed to get FreeRDP event handles");
+      break;
     }
 
-    frdp_session_schedule_close (self);
-    g_task_return_boolean (task, FALSE);
+    status = WaitForMultipleObjects (n, handles, FALSE, FRDP_WORKER_WAIT_MS);
+    if (status == WAIT_FAILED)
+      break;
 
-    return;
-  }
-
-  self->priv->is_connected = freerdp_connect (self->priv->freerdp_session);
-  if (!self->priv->is_connected) {
-    error_code = freerdp_get_last_error (self->priv->freerdp_session->context);
-    switch (error_code) {
-        case FREERDP_ERROR_AUTHENTICATION_FAILED:
-        case FREERDP_ERROR_CONNECT_FAILED:
-        case FREERDP_ERROR_SERVER_DENIED_CONNECTION:
-        case FREERDP_ERROR_CONNECT_NO_OR_MISSING_CREDENTIALS:
-        case FREERDP_ERROR_CONNECT_LOGON_FAILURE:
-        case STATUS_LOGON_FAILURE:
-        case STATUS_PASSWORD_EXPIRED:
-        case FREERDP_ERROR_CONNECT_ACCOUNT_EXPIRED:
-        case FREERDP_ERROR_CONNECT_TRANSPORT_FAILED:
-        case ERRCONNECT_CONNECT_TRANSPORT_FAILED:
-        case FREERDP_ERROR_TLS_CONNECT_FAILED:
-        case FREERDP_ERROR_DNS_NAME_NOT_FOUND:
-            g_signal_emit (self,
-                           signals[RDP_AUTH_FAILURE], 0,
-                           freerdp_get_last_error_string (error_code));
-
-            g_warning ("Failed to connect RDP host with error '%s'",
-                       freerdp_get_last_error_string (error_code));
-            break;
-
-        default:
-            g_signal_emit (self,
-                           signals[RDP_ERROR], 0,
-                           freerdp_get_last_error_string (error_code));
-
-            g_warning ("Unexpected RDP error: '%s'",
-                       freerdp_get_last_error_string (error_code));
-            break;
+    if (!freerdp_check_event_handles (context)) {
+      if (freerdp_get_last_error (context) == FREERDP_ERROR_SUCCESS)
+        g_warning ("Failed to check FreeRDP event handles");
+      break;
     }
-
-    frdp_session_schedule_close (self);
-    g_task_return_boolean (task, FALSE);
-
-    return;
   }
 
-  frdp_session_update_size_request (self);
-  frdp_session_update_scale (self);
-  self->priv->frame_dirty = TRUE;
-  g_signal_connect (self->priv->display, "notify::resize-supported",
-                    G_CALLBACK (frdp_session_resize_supported_changed), self);
+  priv->disconnect_error = freerdp_get_last_error (context);
+  freerdp_disconnect (instance);
 
-  self->priv->update_id = frdp_session_attach_event_source (self);
+  frdp_session_run_on_main (self, frdp_session_worker_done_cb);
 
-  g_task_return_boolean (task, TRUE);
+  return NULL;
+}
+
+static void
+frdp_session_report_connect_failure (FrdpSession *self,
+                                     guint32      error_code)
+{
+  const gchar *message = freerdp_get_last_error_string (error_code);
+
+  switch (error_code) {
+  case FREERDP_ERROR_AUTHENTICATION_FAILED:
+  case FREERDP_ERROR_CONNECT_FAILED:
+  case FREERDP_ERROR_SERVER_DENIED_CONNECTION:
+  case FREERDP_ERROR_CONNECT_NO_OR_MISSING_CREDENTIALS:
+  case FREERDP_ERROR_CONNECT_LOGON_FAILURE:
+  case STATUS_LOGON_FAILURE:
+  case STATUS_PASSWORD_EXPIRED:
+  case FREERDP_ERROR_CONNECT_ACCOUNT_EXPIRED:
+  case FREERDP_ERROR_CONNECT_TRANSPORT_FAILED:
+  case FREERDP_ERROR_TLS_CONNECT_FAILED:
+  case FREERDP_ERROR_DNS_NAME_NOT_FOUND:
+    g_signal_emit (self, signals[RDP_AUTH_FAILURE], 0, message);
+    g_debug ("Failed to connect RDP host with error '%s'", message);
+    break;
+  default:
+    g_signal_emit (self, signals[RDP_ERROR], 0, message);
+    g_debug ("Unexpected RDP error: '%s'", message);
+    break;
+  }
+}
+
+/* Main thread: freerdp_connect() returned on the worker. */
+static gboolean
+frdp_session_connect_done_cb (gpointer user_data)
+{
+  FrdpSession        *self = user_data;
+  FrdpSessionPrivate *priv = self->priv;
+  GTask              *task = g_steal_pointer (&priv->connect_task);
+  gboolean            cancelled = g_atomic_int_get (&priv->closing);
+
+  if (priv->connect_ok && !cancelled) {
+    priv->is_connected = TRUE;
+    if (priv->display != NULL)
+      g_signal_connect (priv->display, "notify::resize-supported",
+                        G_CALLBACK (frdp_session_resize_supported_changed), self);
+    frdp_session_update_size_request (self);
+    frdp_session_update_scale (self);
+    frdp_session_update_mouse_pointer (self);
+    frdp_session_schedule_draw (self);
+    frdp_session_request_remote_resize (self);
+    g_signal_emit (self, signals[RDP_CONNECTED], 0);
+  } else if (!priv->connect_ok && !cancelled) {
+    frdp_session_report_connect_failure (self, priv->connect_error);
+  }
+
+  if (task != NULL) {
+    if (priv->connect_ok && !cancelled)
+      g_task_return_boolean (task, TRUE);
+    else if (cancelled)
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Connection cancelled");
+    else
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s",
+                               freerdp_get_last_error_string (priv->connect_error));
+    g_object_unref (task);
+  }
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+frdp_session_free_instance (FrdpSession *self)
+{
+  FrdpSessionPrivate *priv = self->priv;
+
+  if (priv->freerdp_session == NULL)
+    return;
+
+  /* freerdp_free() frees only the instance struct (FreeRDP 3.32.1
+   * libfreerdp/core/freerdp.c); upstream never freed the context. */
+  if (priv->freerdp_session->context != NULL)
+    freerdp_context_free (priv->freerdp_session);
+  g_clear_pointer (&priv->freerdp_session, freerdp_free);
+}
+
+/* Main thread: the worker has finished (disconnect, error or close). */
+static gboolean
+frdp_session_worker_done_cb (gpointer user_data)
+{
+  FrdpSession        *self = user_data;
+  FrdpSessionPrivate *priv = self->priv;
+  gboolean            cancelled = g_atomic_int_get (&priv->closing);
+  gboolean            was_connected = priv->is_connected;
+  guint32             error = priv->disconnect_error;
+
+  g_thread_join (g_steal_pointer (&priv->worker));
+
+  priv->is_connected = FALSE;
+
+  if (priv->resize_timeout_id != 0) {
+    g_source_remove (priv->resize_timeout_id);
+    priv->resize_timeout_id = 0;
+  }
+
+  if (priv->display != NULL)
+    g_signal_handlers_disconnect_by_func (priv->display,
+                                          G_CALLBACK (frdp_session_resize_supported_changed),
+                                          self);
+
+  frdp_session_free_instance (self);
+
+  g_clear_object (&priv->frame);
+  g_mutex_lock (&priv->state_lock);
+  g_clear_object (&priv->cursor_texture);
+  g_mutex_unlock (&priv->state_lock);
+  priv->monitor_layout_supported = FALSE;
+
+  if (priv->display != NULL) {
+    frdp_session_update_mouse_pointer (self);
+    gtk_widget_queue_draw (priv->display);
+  }
+
+  g_atomic_int_set (&priv->closing, 0);
+
+  if (was_connected && !cancelled && error != FREERDP_ERROR_SUCCESS)
+    g_signal_emit (self, signals[RDP_ERROR], 0, freerdp_get_last_error_string (error));
+
+  g_signal_emit (self, signals[RDP_DISCONNECTED], 0);
+  g_debug ("RDP client disconnected");
+
+#ifdef __GLIBC__
+  /* Each session thread gets its own glibc malloc arena, and freed arena
+   * memory is not returned to the OS by default: without this RSS grew
+   * ~20 MB per session (251 -> 440 MB over 10) although nothing leaked
+   * (flat at 246 MB with MALLOC_ARENA_MAX=2). */
+  malloc_trim (0);
+#endif
+
+  /* Balances the reference taken when the worker started. */
+  g_object_unref (self);
+
+  return G_SOURCE_REMOVE;
 }
 
 static void
@@ -1517,16 +1695,32 @@ frdp_session_set_property (GObject      *object,
 static void
 frdp_session_finalize (GObject *object)
 {
-  FrdpSession *self = (FrdpSession*) object;
+  FrdpSession        *self = (FrdpSession*) object;
+  FrdpSessionPrivate *priv = self->priv;
 
-  idle_close (self);
+  /* The worker holds a reference, so it cannot be running here; only an
+   * instance whose connect never started can remain. */
+  g_warn_if_fail (priv->worker == NULL);
+  frdp_session_free_instance (self);
 
-  g_free (self->priv->hostname);
-  g_free (self->priv->username);
-  if (self->priv->password != NULL)
-    memset (self->priv->password, 0, strlen (self->priv->password));
-  g_free (self->priv->password);
-  g_free (self->priv->domain);
+  g_clear_object (&priv->frame);
+  g_clear_object (&priv->cursor_texture);
+  g_clear_object (&priv->display_control_channel);
+#ifdef FRDP_WITH_CLIPBOARD
+  g_clear_object (&priv->clipboard_channel);
+#endif
+
+  g_mutex_clear (&priv->frame_lock);
+  g_mutex_clear (&priv->state_lock);
+  g_mutex_clear (&priv->prompt_lock);
+  g_cond_clear (&priv->prompt_cond);
+
+  g_free (priv->hostname);
+  g_free (priv->username);
+  if (priv->password != NULL)
+    memset (priv->password, 0, strlen (priv->password));
+  g_free (priv->password);
+  g_free (priv->domain);
 
   G_OBJECT_CLASS (frdp_session_parent_class)->finalize (object);
 }
@@ -1636,6 +1830,11 @@ frdp_session_init (FrdpSession *self)
 {
   self->priv = frdp_session_get_instance_private (self);
 
+  g_mutex_init (&self->priv->frame_lock);
+  g_mutex_init (&self->priv->state_lock);
+  g_mutex_init (&self->priv->prompt_lock);
+  g_cond_init (&self->priv->prompt_cond);
+
   self->priv->is_connected = FALSE;
   self->priv->scale = 1.0;
 }
@@ -1648,6 +1847,12 @@ frdp_session_new (FrdpDisplay *display)
                        NULL);
 }
 
+/**
+ * frdp_session_connect:
+ *
+ * Starts connecting on the session thread and returns immediately; the
+ * callback runs on the main thread once freerdp_connect() has finished.
+ */
 void
 frdp_session_connect (FrdpSession         *self,
                       const gchar         *hostname,
@@ -1656,28 +1861,40 @@ frdp_session_connect (FrdpSession         *self,
                       GAsyncReadyCallback  callback,
                       gpointer             user_data)
 {
-  GTask *task;
-
-  g_free (self->priv->hostname);
-  self->priv->hostname = g_strdup (hostname);
-  self->priv->port = port;
+  FrdpSessionPrivate *priv = self->priv;
+  GTask              *task;
 
   task = g_task_new (self, cancellable, callback, user_data);
-  /* Turn off the asynchronous connection via GTask thread as the FreeRDP
-   * process then runs in the new thread which makes it hard to cooperate
-   * with the original thread running UI leading to random race conditions.
-   * Turn it on again if there will be an async support for connection
-   * added to FreeRDP.
-   * The disadvantage is that the application freezes during connection
-   * for some time.
 
-     g_task_run_in_thread (task, frdp_session_connect_thread);
+  if (priv->worker != NULL) {
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_BUSY,
+                             "A connection is already active");
+    g_object_unref (task);
+    return;
+  }
 
-   */
+  g_free (priv->hostname);
+  priv->hostname = g_strdup (hostname);
+  priv->port = port;
 
-  frdp_session_connect_thread (task, self, user_data, cancellable);
+  if (!frdp_session_init_freerdp (self)) {
+    const gchar *message = "Failed to initialize RDP!";
 
-  g_object_unref (task);
+    if (priv->freerdp_session != NULL && priv->freerdp_session->context != NULL)
+      message = freerdp_get_last_error_string (freerdp_get_last_error (priv->freerdp_session->context));
+    g_signal_emit (self, signals[RDP_ERROR], 0, message);
+    frdp_session_free_instance (self);
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s", message);
+    g_object_unref (task);
+    return;
+  }
+
+  g_atomic_int_set (&priv->closing, 0);
+  priv->connect_task = task;
+  /* Released in frdp_session_worker_done_cb() on the main thread, so the
+   * last reference can never be dropped on the worker. */
+  g_object_ref (self);
+  priv->worker = g_thread_new ("frdp-session", frdp_session_worker, self);
 }
 
 gboolean
@@ -1696,10 +1913,34 @@ frdp_session_is_open (FrdpSession *self)
   return self->priv->is_connected;
 }
 
+/**
+ * frdp_session_close:
+ *
+ * Requests the session to end. Non-blocking: the worker is aborted (also
+ * while still connecting or waiting for a prompt answer) and
+ * #FrdpSession::rdp-disconnected is emitted on the main thread once it has
+ * finished and the FreeRDP context has been freed.
+ */
 void
 frdp_session_close (FrdpSession *self)
 {
-  idle_close (self);
+  FrdpSessionPrivate *priv = self->priv;
+
+  if (priv->worker == NULL)
+    return;
+
+  if (!g_atomic_int_compare_and_exchange (&priv->closing, 0, 1))
+    return;
+
+  /* Stop sending input immediately. */
+  priv->is_connected = FALSE;
+
+  /* Wake a worker that is waiting for a prompt answer. */
+  g_mutex_lock (&priv->prompt_lock);
+  g_cond_broadcast (&priv->prompt_cond);
+  g_mutex_unlock (&priv->prompt_lock);
+
+  freerdp_abort_connect_context (priv->freerdp_session->context);
 
   g_debug ("Closing RDP session");
 }
@@ -1715,7 +1956,9 @@ frdp_session_mouse_event (FrdpSession          *self,
   guint16 flags = 0;
   guint16 xflags = 0;
 
-  g_return_if_fail (priv->freerdp_session != NULL);
+  /* Main thread only; dropped while connecting or closing. */
+  if (!priv->is_connected || priv->freerdp_session == NULL)
+    return;
 
   if (event & FRDP_MOUSE_EVENT_MOVE)
     flags |= PTR_FLAGS_MOVE;
@@ -1776,7 +2019,9 @@ frdp_session_mouse_smooth_scroll_event (FrdpSession          *self,
   rdpInput           *input;
   guint16             flags = 0, value;
 
-  g_return_if_fail (priv->freerdp_session != NULL);
+  /* Main thread only; dropped while connecting or closing. */
+  if (!priv->is_connected || priv->freerdp_session == NULL)
+    return;
 
   if (fabs (delta_y) >= fabs (delta_x)) {
     flags |= PTR_FLAGS_WHEEL;
@@ -1826,12 +2071,6 @@ frdp_session_mouse_pointer  (FrdpSession          *self,
   frdp_session_update_mouse_pointer (self);
 }
 
-/* GTK4 hands over the platform's hardware keycode. Its meaning differs per
- * GDK backend, so the translation to an RDP scancode is per platform:
- *  - Linux (X11 and Wayland): XKB keycodes
- *  - macOS: Apple virtual keycodes
- *  - Windows: GDK reports the Win32 virtual-key code
- * Only the Linux path has been exercised by the spike. */
 void
 frdp_session_send_key (FrdpSession  *self,
                        guint         keycode,
@@ -1840,7 +2079,8 @@ frdp_session_send_key (FrdpSession  *self,
   rdpInput *input;
   guint32   virtual_code, virtual_scan_code;
 
-  g_return_if_fail (self->priv->freerdp_session != NULL);
+  if (!self->priv->is_connected || self->priv->freerdp_session == NULL)
+    return;
   input = self->priv->freerdp_session->context->input;
 
 #if defined(G_OS_WIN32)

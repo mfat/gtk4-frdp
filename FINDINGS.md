@@ -5,7 +5,7 @@ drive a FreeRDP 3 desktop from Python on Linux, as the base for a native
 cross-platform library (the alternative to RDW, see `../rdw/FINDINGS.md`)?
 
 **Answer: yes on Linux. Parity with RDW on every check, better on leaks and
-certificates, one blocker left: the connect still runs on the UI thread.**
+certificates. The blocking-connect blocker is fixed (session thread, below).**
 macOS/Windows not attempted yet.
 
 Source: clone of gitlab.gnome.org/GNOME/gtk-frdp at `83854a2` (2026-07-24),
@@ -64,17 +64,49 @@ cost ~0.7 % of a core idle, not 7 % (a ticks-vs-percent mistake). The GSource
 does not lower idle CPU measurably; it removes the 50 Hz wake-ups and the up to
 20 ms input latency on the UI thread.
 
+## Session thread (the blocker fix)
+
+Pattern taken from the projects that already solved it:
+* **Remmina** (`plugins/rdp/rdp_plugin.c`, `rdp_event.c`): one thread owns the
+  whole FreeRDP session; UI work is queued to the main thread; synchronous UI
+  calls block the worker on a condition variable (`ui_sync_retint`).
+* **FreeRDP SDL3 client** (`client/SDL/SDL3/sdl_context.cpp`, 3.32.1): RDP
+  thread runs `freerdp_connect()` + the event loop; input is sent from the UI
+  thread directly (FreeRDP's transport serialises writes with `WriteLock`).
+* **CoffeeRDP** is a fork of that SDL client that additionally runs every
+  session in its own process (crash isolation; no embeddable widget).
+
+Implementation (`src/frdp-session.c`):
+* worker thread per session: `freerdp_connect()`, event loop, decoding,
+  `freerdp_disconnect()`; the GTK thread never waits on the network;
+* GTK work from FreeRDP callbacks (cursor, resize, caps, redraw) is
+  marshalled with `g_main_context_invoke`, redraws coalesced;
+* `frame_lock` held BeginPaint→EndPaint and around gdi init/resize/free;
+  `snapshot()` copies under it;
+* prompts block only the worker on a `GCond`; the widget emits the signal and
+  `*_finish()` wakes the worker — no nested main loop any more;
+* `close()` is non-blocking: `freerdp_abort_connect_context()`, context freed
+  on the main thread after joining; works mid-connect and mid-prompt;
+* `malloc_trim(0)` after each session on glibc (per-thread arenas otherwise
+  grew RSS ~20 MB/session without any leak; proven with MALLOC_ARENA_MAX=2).
+
+| Measurement | before (UI-thread connect) | after (session thread) |
+|---|---|---|
+| Max UI stall, LAN connect | 160–200 ms | 12–42 ms |
+| Max UI stall, unreachable host (15 s connect) | **15 050 ms** | **23 ms** |
+| `close()` while connecting | n/a (UI frozen) | disconnected 0.00 s later |
+| Widgets freed over 10 cycles | 10/10 | 10/10 |
+| RSS over 10 cycles | flat ~240 MB | flat 224–284 MB (with arena trim) |
+| Idle CPU, settled | ~0.7–0.9 % | ~0.7 %, zero network wake-ups on the UI thread |
+| Certificate prompt | nested main loop | worker blocks on GCond; accept-once not stored |
+
+Screenshots `05`/`06`: input and remote resize through the threaded session.
+
 ## Remaining work before this could ship
 
-1. **Blocking connect (blocker).** `freerdp_connect()` runs on the GTK thread;
-   upstream disabled its threaded variant over "random race conditions". Needs
-   a connect worker with all FreeRDP callbacks (certificate, auth, PostConnect,
-   GDI setup) marshalled to the main thread, or a full worker-owned session.
-2. Prompts still spin a nested main loop (`g_main_context_iteration` until
-   answered) — re-entrancy hazard; move to request/finish objects.
-3. Clipboard: text-only path without FUSE; file clipboard Linux-only.
-4. Keyboard layout detection reads GNOME settings (Linux only).
-5. Cursor is not scaled with the remote-desktop scale factor.
-6. macOS and Windows builds (MSYS2 / Homebrew): not attempted; the key-code
+1. Clipboard: text-only path without FUSE; file clipboard Linux-only.
+3. Keyboard layout detection reads GNOME settings (Linux only).
+4. Cursor is not scaled with the remote-desktop scale factor.
+5. macOS and Windows builds (MSYS2 / Homebrew): not attempted; the key-code
    and event-loop code paths for them are written but untested.
-7. Password is a readable GObject property (also upstream); should be write-only.
+6. Password is a readable GObject property (also upstream); should be write-only.
