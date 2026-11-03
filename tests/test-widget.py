@@ -7,7 +7,9 @@ Needs a display; exits 77 (meson: skipped) without one. Run headless with
 xvfb-run, or GDK_BACKEND=x11 under any X server.
 """
 import gc
+import socket
 import sys
+import threading
 import time
 
 import gi
@@ -18,7 +20,6 @@ from gi.repository import GLib, Gtk, GtkFrdp  # noqa: E402
 
 SKIP = 77
 MAX_UI_STALL = 0.25        # seconds the main loop may be blocked
-FIRST_OPEN_LIMIT = 1.0   # one-time FreeRDP initialisation on the first connection
 UNROUTABLE = "10.255.255.1"  # TCP connect hangs until timeout (or fails fast in some sandboxes)
 
 failures = []
@@ -91,42 +92,46 @@ def test_password_write_only():
     check(not readable and value is None, "password property is write-only")
 
 
-def test_refused_connection():
-    window, display = new_window_with_display()
-    state = {"disconnected": False, "failure": None}
+class ClosingServer:
+    """Loopback TCP server that accepts and immediately closes.
+
+    FreeRDP then fails during its RDP handshake, a deterministic failure
+    that does not go through the refused-connect path (whose warning does a
+    reverse DNS lookup that stalls on some macOS hosts, see
+    test_refused_port)."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def watch(display):
+    state = {"disconnected": 0, "failure": None}
     display.connect("rdp-auth-failure", lambda d, m: state.update(failure=m))
     display.connect("rdp-error", lambda d, m: state.update(failure=m))
-    display.connect("rdp-disconnected", lambda d: state.update(disconnected=True))
+    display.connect("rdp-disconnected",
+                    lambda d: state.update(disconnected=state["disconnected"] + 1))
+    return state
 
-    meter = StallMeter()
-    t0 = time.monotonic()
-    display.open_host("127.0.0.1", 1)        # nothing listens on port 1
-    returned_after = time.monotonic() - t0
-    done = run_until(lambda: state["disconnected"], 20)
-    meter.stop()
 
-    # This is the process's first connection: FreeRDP initialises its codecs
-    # and channels once (0.4-0.5 s on macOS, far less on Linux). Later calls
-    # are checked against the strict limit in test_close_while_connecting.
-    check(returned_after < FIRST_OPEN_LIMIT,
-          f"first open_host() returns promptly ({returned_after * 1000:.0f} ms)")
-    if not done and sys.platform == "darwin":
-        # FreeRDP's failed-connect warning resolves the peer with getnameinfo()
-        # without NI_NUMERICHOST; on macOS CI runners that reverse lookup of
-        # 127.0.0.1 goes to mDNS and stalls longer than this test waits.
-        # The session thread is stuck in FreeRDP, the UI is not.
-        print("skip refused-connection outcome: FreeRDP reverse lookup stalls on this host")
-    else:
-        check(done, "refused connection ends in rdp-disconnected")
-        check(state["failure"] is not None, f"failure is reported ({state['failure']!r})")
-    check(meter.max < FIRST_OPEN_LIMIT,
-          f"UI not blocked while failing (max stall {meter.max * 1000:.0f} ms, includes first-call setup)")
-    if not done:
-        # The session thread is still inside FreeRDP (see above) and holds the
-        # widget; it cannot be freed until FreeRDP returns.
-        window.destroy()
-        return
-
+def check_freed(refs, what):
+    """refs = [window, display]; the caller must hold no other reference."""
+    window, display = refs
+    refs.clear()
     finalized = []
     display.weak_ref(lambda *a: finalized.append(True))
     window.set_child(None)
@@ -134,7 +139,107 @@ def test_refused_connection():
     del window, display
     gc.collect()
     run_until(lambda: finalized, 2)
-    check(bool(finalized), "widget is freed after a failed connection")
+    check(bool(finalized), what)
+
+
+def test_cold_start():
+    """The process's first connection: FreeRDP is initialised for the first
+    time, which must happen on the session thread, not the main loop."""
+    server = ClosingServer()
+    window, display = new_window_with_display()
+    state = watch(display)
+
+    meter = StallMeter()
+    t0 = time.monotonic()
+    display.open_host("127.0.0.1", server.port)
+    returned_after = time.monotonic() - t0
+    done = run_until(lambda: state["disconnected"] > 0, 20)
+    meter.stop()
+
+    check(returned_after < 0.1, f"first open_host() returns immediately ({returned_after * 1000:.0f} ms)")
+    check(meter.max < MAX_UI_STALL, f"UI not blocked on a cold start (max stall {meter.max * 1000:.0f} ms)")
+    check(done, "a dropped connection ends in rdp-disconnected")
+    window.destroy()
+    server.close()
+
+
+def test_handshake_failure():
+    server = ClosingServer()
+    window, display = new_window_with_display()
+    state = watch(display)
+
+    display.open_host("127.0.0.1", server.port)
+    done = run_until(lambda: state["disconnected"] > 0, 20)
+    run_until(lambda: False, 0.3)          # a second emission would arrive now
+    server.close()
+
+    check(done, "handshake failure ends in rdp-disconnected")
+    check(state["failure"] is not None, f"handshake failure is reported ({state['failure']!r})")
+    check(state["disconnected"] == 1, f"rdp-disconnected is emitted once ({state['disconnected']})")
+    check(not display.is_open(), "widget is not open after the failure")
+    refs = [window, display]
+    del window, display
+    check_freed(refs, "widget is freed after a failed connection")
+
+
+def test_refused_port():
+    window, display = new_window_with_display()
+    state = watch(display)
+
+    display.open_host("127.0.0.1", 1)        # nothing listens on port 1
+    done = run_until(lambda: state["disconnected"] > 0, 20)
+    run_until(lambda: False, 0.3)
+
+    if not done and sys.platform == "darwin":
+        # Known FreeRDP limitation, tracked upstream: its failed-connect
+        # warning resolves the peer with getnameinfo() without
+        # NI_NUMERICHOST, and on macOS CI runners that reverse lookup of
+        # 127.0.0.1 stalls in mDNS for longer than this test waits. Only
+        # the session thread waits; the UI does not (test_cold_start).
+        print("skip refused-port outcome: FreeRDP's reverse lookup stalls on this host")
+        window.destroy()
+        return
+    check(done, "refused connection ends in rdp-disconnected")
+    check(state["failure"] is not None, f"refused connection is reported ({state['failure']!r})")
+    check(state["disconnected"] == 1, f"rdp-disconnected is emitted once ({state['disconnected']})")
+    refs = [window, display]
+    del window, display
+    check_freed(refs, "widget is freed after a refused connection")
+
+
+def test_close_while_initializing():
+    """close() in the same main-loop turn as open_host(): the session thread
+    is still creating the FreeRDP instance."""
+    window, display = new_window_with_display()
+    state = watch(display)
+
+    display.open_host(UNROUTABLE, 3389)
+    t_close = time.monotonic()
+    display.close()
+    done = run_until(lambda: state["disconnected"] > 0, 5)
+    took = time.monotonic() - t_close
+    run_until(lambda: False, 0.3)
+
+    check(done, "close() during setup ends the session")
+    check(took < 1.0, f"close() during setup takes effect quickly ({took * 1000:.0f} ms)")
+    check(state["failure"] is None, "a cancelled setup is not reported as a failure")
+    check(state["disconnected"] == 1, f"rdp-disconnected is emitted once ({state['disconnected']})")
+    refs = [window, display]
+    del window, display
+    check_freed(refs, "widget is freed after closing during setup")
+
+
+def test_reconnect_after_failure():
+    server = ClosingServer()
+    window, display = new_window_with_display()
+    state = watch(display)
+    for attempt in (1, 2):
+        before = state["disconnected"]
+        display.open_host("127.0.0.1", server.port)
+        done = run_until(lambda: state["disconnected"] > before, 20)
+        check(done, f"attempt {attempt} on the same widget completes")
+    server.close()
+    window.destroy()
 
 
 def test_close_while_connecting():
@@ -172,8 +277,11 @@ def main():
     if not Gtk.init_check():
         print("no display available; skipping")
         return SKIP
-    for test in (test_create_destroy, test_password_write_only,
-                 test_refused_connection, test_close_while_connecting):
+    # test_cold_start must make the process's first connection.
+    for test in (test_create_destroy, test_password_write_only, test_cold_start,
+                 test_handshake_failure, test_refused_port,
+                 test_close_while_initializing, test_close_while_connecting,
+                 test_reconnect_after_failure):
         print(f"# {test.__name__}")
         test()
     return 1 if failures else 0

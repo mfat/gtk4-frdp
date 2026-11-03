@@ -16,6 +16,13 @@ First release as a standalone GTK 4 library, derived from gtk-frdp
   GObject Introspection namespace `GtkFrdp-4.0`, pkg-config
   `gtk4-frdp-4.0`, header `<gtk4-frdp.h>`.
 - `password` is write-only.
+- FreeRDP is set up on the session thread: the first `open_host()` in a
+  process no longer blocks the main loop while FreeRDP initialises
+  (0.4-1 s on macOS). Settings are copied when `open_host()` is called.
+- `rdp-disconnected` is emitted once per connection attempt (a failed
+  connect emitted it twice).
+- Builds on macOS (Homebrew) and with MSVC/clang-cl against gvsbuild GTK;
+  the public API is exported from Windows DLLs.
 - FreeRDP 3.11 or newer is required; FreeRDP 2 support was removed.
 - New clipboard implementation for GTK 4 (gtk-frdp's GTK 3/FUSE one is
   replaced): text, images and HTML in both directions, fully asynchronous,

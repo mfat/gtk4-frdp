@@ -392,8 +392,9 @@ frdp_display_open_host_cb (GObject      *source_object,
 
     g_debug ("Connection established");
   } else {
-    g_signal_emit (self, signals[RDP_DISCONNECTED], 0);
-
+    /* rdp-disconnected comes once, from the session, when its thread has
+     * finished (frdp_display_disconnected); emitting it here as well made a
+     * failed connect report it twice. */
     g_debug ("Connection failed");
   }
 

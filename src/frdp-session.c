@@ -88,6 +88,47 @@ struct frdp_pointer
 };
 typedef struct frdp_pointer frdpPointer;
 
+/* Connection settings copied on the main thread in frdp_session_connect():
+ * the session thread builds the FreeRDP instance from these, so properties
+ * the application changes meanwhile cannot race with it. */
+typedef struct
+{
+  gchar    *hostname;
+  gchar    *username;
+  gchar    *password;
+  gchar    *domain;
+  guint     port;
+  gboolean  clipboard;
+  gboolean  audio_playback;
+  guint32   keyboard_layout;   /* resolved on the main thread (GDK) */
+} FrdpConnectParams;
+
+/* Overwrite a secret before freeing it; the volatile writes cannot be
+ * optimised away as a dead store. */
+static void
+frdp_wipe_string (gchar *str)
+{
+  volatile gchar *p = str;
+
+  while (*p != '\0')
+    *p++ = '\0';
+}
+
+static void
+frdp_connect_params_free (FrdpConnectParams *params)
+{
+  if (params == NULL)
+    return;
+  g_free (params->hostname);
+  g_free (params->username);
+  if (params->password != NULL) {
+    frdp_wipe_string (params->password);
+    g_free (params->password);
+  }
+  g_free (params->domain);
+  g_free (params);
+}
+
 typedef enum
 {
   FRDP_PROMPT_AUTHENTICATION,
@@ -115,7 +156,12 @@ struct _FrdpSessionPrivate
 {
   /* Created on the main thread, owned by the worker while it runs, freed on
    * the main thread after the worker has been joined. */
+  /* Created on the session thread and published under instance_lock, so
+   * close() can abort a connect that is still being set up. */
   freerdp      *freerdp_session;
+  GMutex        instance_lock;
+  FrdpConnectParams *connect_params; /* main -> worker; freed by the worker */
+  gboolean      init_failed;        /* written by worker before connect_done */
   GThread      *worker;
   GTask        *connect_task;
   gint          closing;            /* atomic */
@@ -1110,6 +1156,11 @@ frdp_pre_connect (freerdp *freerdp_session)
 {
   rdpSettings *settings = freerdp_session->context->settings;
   rdpContext *context = freerdp_session->context;
+
+  /* freerdp_connect() resets the abort event before calling us, so a
+   * close() that came just before it would otherwise be lost. */
+  if (g_atomic_int_get (&((frdpContext *) context)->self->priv->closing))
+    return FALSE;
   BYTE *OrderSupport = freerdp_settings_get_pointer_writable(settings, FreeRDP_OrderSupport);
 
   if (OrderSupport != NULL) {
@@ -1210,66 +1261,73 @@ frdp_post_disconnect (freerdp *instance)
   g_mutex_unlock (&priv->frame_lock);
 }
 
-/* Main thread (called from frdp_session_init_freerdp). */
-static void
-frdp_session_set_current_keyboard_layout (FrdpSession *self)
+/* Main thread: layout detection may ask GDK for the keyboard device. */
+static guint32
+frdp_session_resolve_keyboard_layout (FrdpSession *self)
 {
-  FrdpSessionPrivate *priv = self->priv;
-  rdpSettings        *settings = priv->freerdp_session->context->settings;
-  const char         *source = "property";
-  guint32             layout = priv->keyboard_layout;
+  const char *source = "property";
+  guint32     layout = self->priv->keyboard_layout;
+  gint64      t_start = g_get_monotonic_time ();
 
   if (layout == 0)
     layout = frdp_keyboard_layout_detect (&source);
 
-  freerdp_settings_set_uint32 (settings, FreeRDP_KeyboardLayout, layout);
-  g_debug ("Keyboard layout 0x%08x (%s, from %s)", layout,
-           freerdp_keyboard_get_layout_name_from_id (layout), source);
+  g_debug ("Keyboard layout 0x%08x (%s, from %s) in %.1f ms on the main thread", layout,
+           freerdp_keyboard_get_layout_name_from_id (layout), source,
+           (g_get_monotonic_time () - t_start) / 1000.0);
+  return layout;
 }
 
-static gboolean
-frdp_session_init_freerdp (FrdpSession *self)
+/* Session thread: build the FreeRDP instance. Its first creation in a
+ * process initialises FreeRDP's codecs and channels, which took 0.4-0.6 s
+ * on macOS when this ran on the main thread. Returns NULL on failure. */
+static freerdp *
+frdp_session_create_instance (FrdpSession       *self,
+                              FrdpConnectParams *params)
 {
   CONST_QUALIFIER gchar *collections[] = { "disp" };
-  FrdpSessionPrivate    *priv = self->priv;
+  freerdp               *instance;
   rdpSettings           *settings;
   gchar                 *build_options;
   int                    count = 1;
+  gint64                 t_start = g_get_monotonic_time ();
+  gint64                 t_context;
 
-  /* Setup FreeRDP session */
-  priv->freerdp_session = freerdp_new ();
+  instance = freerdp_new ();
+  if (instance == NULL)
+    return NULL;
 
-  if (priv->freerdp_session == NULL)
-    return FALSE;
+  instance->PreConnect = frdp_pre_connect;
+  instance->PostConnect = frdp_post_connect;
+  instance->PostDisconnect = frdp_post_disconnect;
+  instance->AuthenticateEx = frdp_authenticate_ex;
+  instance->VerifyCertificateEx = frdp_certificate_verify_ex;
+  instance->VerifyChangedCertificateEx = frdp_changed_certificate_verify_ex;
+  instance->LoadChannels = frdp_load_channels;
 
-  priv->freerdp_session->PreConnect = frdp_pre_connect;
-  priv->freerdp_session->PostConnect = frdp_post_connect;
-  priv->freerdp_session->PostDisconnect = frdp_post_disconnect;
-  priv->freerdp_session->AuthenticateEx = frdp_authenticate_ex;
-  priv->freerdp_session->VerifyCertificateEx = frdp_certificate_verify_ex;
-  priv->freerdp_session->VerifyChangedCertificateEx = frdp_changed_certificate_verify_ex;
-  priv->freerdp_session->LoadChannels = frdp_load_channels;
+  instance->ContextSize = sizeof (frdpContext);
 
-  priv->freerdp_session->ContextSize = sizeof (frdpContext);
+  if (!freerdp_context_new (instance)) {
+    freerdp_free (instance);
+    return NULL;
+  }
 
-  if (!freerdp_context_new (priv->freerdp_session))
-    return FALSE;
+  ((frdpContext *) instance->context)->self = self;
+  t_context = g_get_monotonic_time ();
 
-  ((frdpContext *) priv->freerdp_session->context)->self = self;
+  settings = instance->context->settings;
 
-  settings = priv->freerdp_session->context->settings;
-
-  freerdp_settings_set_string (settings, FreeRDP_ServerHostname, priv->hostname);
-  freerdp_settings_set_uint32 (settings, FreeRDP_ServerPort, priv->port);
-  freerdp_settings_set_string (settings, FreeRDP_Username, priv->username);
-  freerdp_settings_set_string (settings, FreeRDP_Password, priv->password);
-  freerdp_settings_set_string (settings, FreeRDP_Domain, priv->domain);
+  freerdp_settings_set_string (settings, FreeRDP_ServerHostname, params->hostname);
+  freerdp_settings_set_uint32 (settings, FreeRDP_ServerPort, params->port);
+  freerdp_settings_set_string (settings, FreeRDP_Username, params->username);
+  freerdp_settings_set_string (settings, FreeRDP_Password, params->password);
+  freerdp_settings_set_string (settings, FreeRDP_Domain, params->domain);
 
   /* Without INFO_AUTOLOGON Windows authenticates the connection (NLA) and
    * then stops at its own logon screen; some hosts draw that black and drop
    * the session after ~55 s (ERRINFO_RPC_INITIATED_DISCONNECT). FreeRDP's
    * own clients never set it; Remmina does when a password is known. */
-  if (priv->password != NULL && *priv->password != '\0')
+  if (params->password != NULL && *params->password != '\0')
     freerdp_settings_set_bool (settings, FreeRDP_AutoLogonEnabled, TRUE);
 
   freerdp_settings_set_bool (settings, FreeRDP_AllowFontSmoothing, TRUE);
@@ -1292,8 +1350,8 @@ frdp_session_init_freerdp (FrdpSession *self)
   freerdp_settings_set_uint32 (settings, FreeRDP_ColorDepth, 32);
   /* FreeRDP's add-in loader turns these into the cliprdr / rdpsnd channels;
    * rdpsnd plays the audio itself (PulseAudio, ALSA, ...). */
-  freerdp_settings_set_bool (settings, FreeRDP_RedirectClipboard, priv->clipboard);
-  freerdp_settings_set_bool (settings, FreeRDP_AudioPlayback, priv->audio_playback);
+  freerdp_settings_set_bool (settings, FreeRDP_RedirectClipboard, params->clipboard);
+  freerdp_settings_set_bool (settings, FreeRDP_AudioPlayback, params->audio_playback);
   freerdp_settings_set_bool (settings, FreeRDP_SupportGraphicsPipeline, TRUE);
 
   freerdp_client_add_dynamic_channel (settings, count, collections);
@@ -1308,11 +1366,24 @@ frdp_session_init_freerdp (FrdpSession *self)
   }
   g_free (build_options);
 
-  frdp_session_set_current_keyboard_layout (self);
+  freerdp_settings_set_uint32 (settings, FreeRDP_KeyboardLayout, params->keyboard_layout);
 
   freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0);
 
-  return TRUE;
+  g_debug ("FreeRDP instance ready on the session thread: context %.1f ms, settings %.1f ms",
+           (t_context - t_start) / 1000.0, (g_get_monotonic_time () - t_context) / 1000.0);
+
+  return instance;
+}
+
+static void
+frdp_instance_free (freerdp *instance)
+{
+  /* freerdp_free() frees only the instance struct (FreeRDP 3.32.1
+   * libfreerdp/core/freerdp.c); upstream never freed the context. */
+  if (instance->context != NULL)
+    freerdp_context_free (instance);
+  freerdp_free (instance);
 }
 
 /* ---- session thread --------------------------------------------------------- */
@@ -1325,15 +1396,37 @@ frdp_session_worker (gpointer data)
 {
   FrdpSession        *self = data;
   FrdpSessionPrivate *priv = self->priv;
-  freerdp            *instance = priv->freerdp_session;
-  rdpContext         *context = instance->context;
+  freerdp            *instance;
+  rdpContext         *context;
+
+  instance = frdp_session_create_instance (self, priv->connect_params);
+  g_clear_pointer (&priv->connect_params, frdp_connect_params_free);
+
+  g_mutex_lock (&priv->instance_lock);
+  if (instance != NULL && !g_atomic_int_get (&priv->closing))
+    priv->freerdp_session = instance;
+  g_mutex_unlock (&priv->instance_lock);
+
+  if (priv->freerdp_session == NULL) {
+    /* Setup failed, or close() came first. */
+    priv->init_failed = (instance == NULL);
+    g_clear_pointer (&instance, frdp_instance_free);
+    priv->connect_ok = FALSE;
+    priv->connect_error = FREERDP_ERROR_CONNECT_FAILED;
+    priv->disconnect_error = FREERDP_ERROR_SUCCESS;
+    frdp_session_run_on_main (self, frdp_session_connect_done_cb);
+    frdp_session_run_on_main (self, frdp_session_worker_done_cb);
+    return NULL;
+  }
+  context = instance->context;
 
   priv->connect_ok = freerdp_connect (instance);
   priv->connect_error = priv->connect_ok ? FREERDP_ERROR_SUCCESS
                                          : freerdp_get_last_error (context);
   frdp_session_run_on_main (self, frdp_session_connect_done_cb);
 
-  while (priv->connect_ok && !freerdp_shall_disconnect_context (context)) {
+  while (priv->connect_ok && !g_atomic_int_get (&priv->closing) &&
+         !freerdp_shall_disconnect_context (context)) {
     HANDLE handles[MAXIMUM_WAIT_OBJECTS];
     DWORD  n, status;
 
@@ -1410,6 +1503,8 @@ frdp_session_connect_done_cb (gpointer user_data)
     frdp_session_schedule_draw (self);
     frdp_session_request_remote_resize (self);
     g_signal_emit (self, signals[RDP_CONNECTED], 0);
+  } else if (priv->init_failed && !cancelled) {
+    g_signal_emit (self, signals[RDP_ERROR], 0, "Failed to initialize RDP!");
   } else if (!priv->connect_ok && !cancelled) {
     frdp_session_report_connect_failure (self, priv->connect_error);
   }
@@ -1433,14 +1528,9 @@ frdp_session_free_instance (FrdpSession *self)
 {
   FrdpSessionPrivate *priv = self->priv;
 
-  if (priv->freerdp_session == NULL)
-    return;
-
-  /* freerdp_free() frees only the instance struct (FreeRDP 3.32.1
-   * libfreerdp/core/freerdp.c); upstream never freed the context. */
-  if (priv->freerdp_session->context != NULL)
-    freerdp_context_free (priv->freerdp_session);
-  g_clear_pointer (&priv->freerdp_session, freerdp_free);
+  /* Main thread, after the worker has been joined. */
+  g_clear_pointer (&priv->freerdp_session, frdp_instance_free);
+  priv->init_failed = FALSE;
 }
 
 /* Main thread: the worker has finished (disconnect, error or close). */
@@ -1624,6 +1714,7 @@ frdp_session_finalize (GObject *object)
   g_mutex_clear (&priv->frame_lock);
   g_mutex_clear (&priv->state_lock);
   g_mutex_clear (&priv->prompt_lock);
+  g_mutex_clear (&priv->instance_lock);
   g_cond_clear (&priv->prompt_cond);
 
   g_free (priv->hostname);
@@ -1758,6 +1849,7 @@ frdp_session_init (FrdpSession *self)
   g_mutex_init (&self->priv->frame_lock);
   g_mutex_init (&self->priv->state_lock);
   g_mutex_init (&self->priv->prompt_lock);
+  g_mutex_init (&self->priv->instance_lock);
   g_cond_init (&self->priv->prompt_cond);
 
   self->priv->is_connected = FALSE;
@@ -1804,17 +1896,16 @@ frdp_session_connect (FrdpSession         *self,
   priv->hostname = g_strdup (hostname);
   priv->port = port;
 
-  if (!frdp_session_init_freerdp (self)) {
-    const gchar *message = "Failed to initialize RDP!";
-
-    if (priv->freerdp_session != NULL && priv->freerdp_session->context != NULL)
-      message = freerdp_get_last_error_string (freerdp_get_last_error (priv->freerdp_session->context));
-    g_signal_emit (self, signals[RDP_ERROR], 0, message);
-    frdp_session_free_instance (self);
-    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s", message);
-    g_object_unref (task);
-    return;
-  }
+  priv->connect_params = g_new0 (FrdpConnectParams, 1);
+  priv->connect_params->hostname = g_strdup (priv->hostname);
+  priv->connect_params->username = g_strdup (priv->username);
+  priv->connect_params->password = g_strdup (priv->password);
+  priv->connect_params->domain = g_strdup (priv->domain);
+  priv->connect_params->port = priv->port;
+  priv->connect_params->clipboard = priv->clipboard;
+  priv->connect_params->audio_playback = priv->audio_playback;
+  priv->connect_params->keyboard_layout = frdp_session_resolve_keyboard_layout (self);
+  priv->init_failed = FALSE;
 
   g_atomic_int_set (&priv->closing, 0);
   priv->connect_task = task;
@@ -1874,7 +1965,13 @@ frdp_session_close (FrdpSession *self)
   g_cond_broadcast (&priv->prompt_cond);
   g_mutex_unlock (&priv->prompt_lock);
 
-  freerdp_abort_connect_context (priv->freerdp_session->context);
+  /* The worker may still be creating the instance: it checks closing
+   * before publishing it, and frdp_pre_connect() checks again after
+   * freerdp_connect() has reset FreeRDP's abort event. */
+  g_mutex_lock (&priv->instance_lock);
+  if (priv->freerdp_session != NULL && priv->freerdp_session->context != NULL)
+    freerdp_abort_connect_context (priv->freerdp_session->context);
+  g_mutex_unlock (&priv->instance_lock);
 
   g_debug ("Closing RDP session");
 }
