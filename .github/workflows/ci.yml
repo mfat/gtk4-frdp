@@ -118,7 +118,9 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build tools
-        run: python -m pip install meson ninja
+        # setuptools: gvsbuild's g-ir-scanner imports distutils, which
+        # Python 3.12 removed; setuptools provides it.
+        run: python -m pip install meson ninja setuptools
 
       - name: Build
         shell: pwsh

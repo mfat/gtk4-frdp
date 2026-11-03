@@ -8,7 +8,8 @@
 #   lib\girepository-1.0\GtkFrdp-4.0.typelib
 #
 # Run from a Visual Studio x64 developer shell with CMake, Ninja, clang-cl,
-# Python 3.14 (gvsbuild's g-ir-scanner is built for it) and vcpkg
+# Python 3.14 with setuptools (gvsbuild's g-ir-scanner is built for it and
+# imports distutils) and vcpkg
 # (VCPKG_INSTALLATION_ROOT). gtk4-frdp needs clang-cl, not cl: it uses
 # GLib's g_autofree/g_autoptr cleanup macros.
 param(
