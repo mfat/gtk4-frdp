@@ -1,0 +1,28 @@
+[library]
+version = "@version@"
+browse_url = "https://github.com/mfat/gtk4-frdp"
+repository_url = "https://github.com/mfat/gtk4-frdp"
+authors = "mFat, and the gtk-frdp authors (Felipe Borges, Marek Kasik, Armin Novak, et al.)"
+license = "GPL-3.0-or-later"
+description = "GTK 4 widget for embedding FreeRDP 3 remote desktops"
+dependencies = [ "Gtk-4.0" ]
+devhelp = true
+search_index = true
+
+  [dependencies."Gtk-4.0"]
+  name = "Gtk"
+  description = "The GTK toolkit"
+  docs_url = "https://docs.gtk.org/gtk4/"
+
+[theme]
+name = "basic"
+show_index_summary = true
+show_class_hierarchy = true
+
+[source-location]
+base_url = "https://github.com/mfat/gtk4-frdp/blob/main/"
+
+[extra]
+content_files = [
+  "design.md",
+]
