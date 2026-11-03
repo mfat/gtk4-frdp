@@ -1,0 +1,154 @@
+# gtk4-frdp
+
+A GTK 4 widget that embeds a remote desktop over RDP, using
+[FreeRDP 3](https://www.freerdp.com/). Drop `FrdpDisplay` into any GTK 4
+window — in C, Python, JavaScript or any other language with GObject
+Introspection — and get the remote desktop, keyboard and mouse input,
+dynamic resolution, and certificate and login prompts.
+
+- **Non-blocking:** each connection runs on its own thread, which owns
+  FreeRDP. Connecting, network I/O and decoding never freeze the UI, and
+  `close()` cancels a connection that is still in progress.
+- **GTK 4 native:** event controllers, `snapshot()` rendering with
+  `GdkMemoryTexture`, Wayland and X11.
+- **Full FreeRDP:** NLA/TLS, the graphics pipeline, Display Control
+  (the server follows the widget size), and FreeRDP's certificate store.
+- **Bindings for free:** GObject Introspection namespace `GtkFrdp-4.0`.
+
+gtk4-frdp is derived from GNOME's GTK 3 library
+[gtk-frdp](https://gitlab.gnome.org/GNOME/gtk-frdp). See [NOTICE](NOTICE)
+for what changed.
+
+> Status: 0.1 — works on Linux (tested against a Windows 10 Pro host).
+> macOS and Windows builds are not tested yet. The API may still
+> change before 1.0.
+
+## Quick start
+
+### Python
+
+```python
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("GtkFrdp", "4.0")
+from gi.repository import Gtk, GtkFrdp
+
+def on_activate(app):
+    window = Gtk.ApplicationWindow(application=app, default_width=1280, default_height=800)
+    display = GtkFrdp.Display(allow_resize=True)
+    display.props.username = "alice"
+    display.props.password = "secret"            # write-only
+    # Accept the server certificate for this session only (show a dialog in real code).
+    display.connect("rdp-needs-certificate-verification",
+                    lambda d, *cert: d.certificate_verify_ex_finish(2))
+    display.connect("rdp-disconnected", lambda d: window.destroy())
+    window.set_child(display)
+    window.present()
+    display.open_host("rdp.example.com", 3389)   # returns immediately
+
+app = Gtk.Application()
+app.connect("activate", on_activate)
+app.run()
+```
+
+### C
+
+```c
+#include <gtk4-frdp.h>
+
+GtkWidget *display = frdp_display_new ();
+g_object_set (display, "username", "alice", "password", password,
+              "allow-resize", TRUE, NULL);
+g_signal_connect (display, "rdp-needs-certificate-verification",
+                  G_CALLBACK (on_certificate), window);
+gtk_window_set_child (window, display);
+frdp_display_open_host (FRDP_DISPLAY (display), "rdp.example.com", 3389);
+```
+
+Compile with `pkg-config --cflags --libs gtk4-frdp-4.0`.
+
+Complete viewers with a certificate dialog and a login prompt are in
+[`examples/`](examples/) (C and Python).
+
+## API overview
+
+| | |
+|---|---|
+| `frdp_display_new()` | create the widget |
+| `open_host(host, port)` | connect (asynchronous) |
+| `close()` | disconnect or cancel (asynchronous) |
+| `is_open()` | whether a session is established |
+| properties | `username`, `password` (write-only), `domain`, `scaling`, `allow-resize`, `resize-supported` (read-only) |
+| signals | `rdp-connected`, `rdp-disconnected`, `rdp-error`, `rdp-auth-failure`, `rdp-needs-certificate-verification`, `rdp-needs-certificate-change-verification`, `rdp-needs-authentication` |
+| answering prompts | `certificate_verify_ex_finish()`, `certificate_change_verify_ex_finish()`, `authenticate_finish()` |
+
+All signals are emitted on the GTK main thread. Prompts can be answered from
+the signal handler or later; the connection waits, the UI does not. The full
+reference is built with `-Ddocumentation=true` (gi-docgen) and includes a
+[design and threading page](docs/design.md).
+
+## Building
+
+Requirements: GTK ≥ 4.14, GLib ≥ 2.66, FreeRDP 3 ≥ 3.11 (`freerdp3`,
+`freerdp-client3`, `winpr3`), Meson ≥ 0.62. Optional: GObject Introspection
+(on by default), gi-docgen (docs).
+
+```sh
+# Debian/Ubuntu
+sudo apt install meson ninja-build libgtk-4-dev freerdp3-dev libwinpr3-dev \
+                 gobject-introspection libgirepository1.0-dev
+# Fedora
+sudo dnf install meson gtk4-devel freerdp-devel gobject-introspection-devel
+
+meson setup _build
+meson compile -C _build
+xvfb-run -a meson test -C _build      # tests need a display
+sudo meson install -C _build
+```
+
+Options (`meson configure _build`):
+
+| Option | Default | |
+|---|---|---|
+| `introspection` | true | GIR/typelib for Python, JavaScript, ... |
+| `documentation` | false | API reference (needs gi-docgen) |
+| `examples` | false | build the C example viewer |
+| `tests` | true | register the test suite |
+
+### Using it as a Meson subproject
+
+```meson
+gtk4_frdp_dep = dependency('gtk4-frdp-4.0',
+  fallback: ['gtk4-frdp', 'gtk4_frdp_dep'])
+```
+
+### Running from a build tree
+
+```sh
+LD_LIBRARY_PATH=_build/src GI_TYPELIB_PATH=_build/src \
+  examples/gtk4-frdp-viewer.py rdp.example.com alice
+```
+
+## Testing against a real server
+
+```sh
+GTK4_FRDP_TEST_HOST=rdp.example.com GTK4_FRDP_TEST_USER=alice \
+GTK4_FRDP_TEST_PASSWORD_FILE=~/.rdp-test-password \
+xvfb-run -a meson test -C _build --suite live
+```
+
+`tests/live-session.py` can also be run by hand for longer soak runs
+(`--cycles`, `--hold`, `--idle-cpu`, `--abort-after`).
+
+## Known gaps
+
+- No clipboard yet: gtk-frdp's GTK 3 clipboard channel
+  (`src/frdp-channel-clipboard.c`) still needs porting to GTK 4.
+- Keyboard layout detection reads GNOME settings.
+- The remote cursor is not scaled when the desktop is scaled.
+- macOS and Windows: code paths exist, builds are untested.
+
+## License
+
+GPL-3.0-or-later. See [COPYING](COPYING) and [NOTICE](NOTICE). The original
+gtk-frdp files keep their authors' copyright notices.

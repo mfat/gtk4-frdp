@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    # FreeRDP >= 3.11 is needed; Fedora ships current FreeRDP 3.
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y git meson gcc gtk4-devel freerdp-devel \
+            gobject-introspection-devel python3-gobject gi-docgen \
+            xorg-x11-server-Xvfb xorg-x11-xauth
+
+      - uses: actions/checkout@v4
+
+      - name: Build (defaults + docs + examples)
+        run: |
+          meson setup _build -Ddocumentation=true -Dexamples=true
+          meson compile -C _build
+
+      - name: Test
+        run: xvfb-run -a meson test -C _build --print-errorlogs
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog
+          path: _build/meson-logs/testlog.txt

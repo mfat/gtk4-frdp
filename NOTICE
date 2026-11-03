@@ -1,16 +1,17 @@
-gtk4-frdp — GTK4 widget for embedding FreeRDP 3 remote desktops
+gtk4-frdp — GTK 4 widget for embedding FreeRDP 3 remote desktops
 
 License: GPL-3.0-or-later (see COPYING / LICENSES/GPL-3.0-or-later.txt).
 Two inherited files remain LGPL-3.0-or-later as their authors released them
-(src/gtk-frdp.h, src/gtk-frdp-version.h.in; LICENSES/LGPL-3.0-or-later.txt);
-LGPLv3 permits combining them into this GPL-3.0-or-later library.
+(src/gtk4-frdp.h, src/gtk4-frdp-version.h.in — formerly gtk-frdp.h and
+gtk-frdp-version.h.in; LICENSES/LGPL-3.0-or-later.txt). LGPLv3 permits
+combining them into this GPL-3.0-or-later library.
 
 Provenance
 ----------
 Derived from gtk-frdp (https://gitlab.gnome.org/GNOME/gtk-frdp), commit
-83854a2 (2026-07-24). Upstream's COPYING file is LGPL-3.0, but its source
-files carry GPL-3.0-or-later headers; this project follows the per-file
-GPL-3.0-or-later notices.
+83854a2 (2026-07-24); its full history is kept in this repository.
+Upstream's COPYING file is LGPL-3.0, but its source files carry
+GPL-3.0-or-later headers; this project follows the per-file notices.
 
 Upstream copyright holders (notices kept in each file):
   Felipe Borges, Marek Kasik, Armin Novak; further contributions to the
@@ -18,14 +19,16 @@ Upstream copyright holders (notices kept in each file):
   (see `git log 83854a2 -- src`).
 
 Changes since upstream (Copyright (C) 2026 mFat):
-  - GTK4 port of FrdpDisplay and FrdpSession (event controllers,
-    snapshot()/GdkMemoryTexture rendering, GTK4 cursors and shortcuts
-    inhibition); FreeRDP 3 only; clipboard optional.
+  - GTK 4 port of FrdpDisplay and FrdpSession (event controllers,
+    snapshot()/GdkMemoryTexture rendering, GTK 4 cursors and shortcut
+    inhibition); FreeRDP 3 only; clipboard channel not yet ported.
   - Per-session worker thread owning FreeRDP; prompts answered without a
     nested main loop; non-blocking close.
+  - Public API limited to FrdpDisplay; write-only password property.
   - Fixes: widget/session/FreeRDP-context leaks, use-after-free after a
     failed connect, hang on synchronously answered certificate prompts,
     stalled network processing for hidden widgets.
+  - New examples, tests and documentation.
 
 Design references (no code copied): Remmina's RDP plugin (GPL-2.0-or-later
 with OpenSSL exception) and FreeRDP's SDL3 client (Apache-2.0) for the
