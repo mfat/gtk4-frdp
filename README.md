@@ -21,7 +21,8 @@ gtk4-frdp is derived from GNOME's GTK 3 library
 for what changed.
 
 > Status: 0.1 — works on Linux (tested against a Windows 10 Pro host).
-> macOS and Windows builds are not tested yet. The API may still
+> Windows (MSYS2) builds and passes the non-server tests in CI; a live
+> session on Windows has not been tested yet. macOS is untested. The API may still
 > change before 1.0.
 
 ## Quick start
@@ -67,6 +68,9 @@ frdp_display_open_host (FRDP_DISPLAY (display), "rdp.example.com", 3389);
 ```
 
 Compile with `pkg-config --cflags --libs gtk4-frdp-4.0`.
+
+On Windows, build in an MSYS2 UCRT64 shell (`pacman -S mingw-w64-ucrt-x86_64-{gtk4,freerdp,meson,gobject-introspection,python-gobject}`);
+see `.github/workflows/ci.yml`.
 
 Complete viewers with a certificate dialog and a login prompt are in
 [`examples/`](examples/) (C and Python).
@@ -151,7 +155,8 @@ xvfb-run -a meson test -C _build --suite live
 - Clipboard: text and images work in both directions; HTML is implemented
   but not yet tested against Windows applications; copying files is not
   supported.
-- macOS and Windows: code paths exist, builds are untested.
+- Windows: builds and passes the automated tests (MSYS2, CI); not yet
+  tested against a live server. macOS: untested.
 
 ## License
 
