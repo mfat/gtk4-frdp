@@ -15,6 +15,16 @@ test_header = executable('test-header', 'test-header.c',
 )
 test('header', test_header, env: test_env)
 
+# Internal module, compiled directly (not part of the public API).
+test_keyboard_layout = executable('test-keyboard-layout',
+  'test-keyboard-layout.c',
+  '../src/frdp-keyboard-layout.c',
+  '../src/frdp-xkb-layout-ids.c',
+  include_directories: include_directories('../src'),
+  dependencies: deps,
+)
+test('keyboard-layout', test_keyboard_layout)
+
 python = find_program('python3', required: false)
 if get_option('introspection') and python.found()
   test('widget', python,

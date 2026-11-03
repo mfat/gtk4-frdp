@@ -78,9 +78,14 @@ Complete viewers with a certificate dialog and a login prompt are in
 | `open_host(host, port)` | connect (asynchronous) |
 | `close()` | disconnect or cancel (asynchronous) |
 | `is_open()` | whether a session is established |
-| properties | `username`, `password` (write-only), `domain`, `scaling`, `allow-resize`, `resize-supported` (read-only) |
+| properties | `username`, `password` (write-only), `domain`, `keyboard-layout` (0 = detect), `scaling`, `allow-resize`, `resize-supported` (read-only) |
 | signals | `rdp-connected`, `rdp-disconnected`, `rdp-error`, `rdp-auth-failure`, `rdp-needs-certificate-verification`, `rdp-needs-certificate-change-verification`, `rdp-needs-authentication` |
 | answering prompts | `certificate_verify_ex_finish()`, `certificate_change_verify_ex_finish()`, `authenticate_finish()` |
+
+The keyboard layout announced to the server is detected automatically: the
+active layout on Windows, GNOME's input sources, the GTK keyboard device
+(GTK 4.18+, any desktop), KDE's configuration, `XKB_DEFAULT_LAYOUT`, then the
+system language. Set `keyboard-layout` to override it.
 
 All signals are emitted on the GTK main thread. Prompts can be answered from
 the signal handler or later; the connection waits, the UI does not. The full
@@ -144,7 +149,6 @@ xvfb-run -a meson test -C _build --suite live
 
 - No clipboard yet: gtk-frdp's GTK 3 clipboard channel
   (`src/frdp-channel-clipboard.c`) still needs porting to GTK 4.
-- Keyboard layout detection reads GNOME settings.
 - macOS and Windows: code paths exist, builds are untested.
 
 ## License

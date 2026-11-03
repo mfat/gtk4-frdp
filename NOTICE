@@ -30,6 +30,12 @@ Changes since upstream (Copyright (C) 2026 mFat):
     stalled network processing for hidden widgets.
   - New examples, tests and documentation.
 
+Imported code:
+  src/frdp-xkb-layout-ids.[ch] — FreeRDP 3.32.1 client/X11/xkb_layout_ids.[ch],
+  Copyright 2009-2012 Marc-Andre Moreau, Apache-2.0
+  (LICENSES/Apache-2.0.txt); table unchanged, lookup adapted (see header).
+  Apache-2.0 code may be combined into a GPL-3.0-or-later work.
+
 Design references (no code copied): Remmina's RDP plugin (GPL-2.0-or-later
 with OpenSSL exception) and FreeRDP's SDL3 client (Apache-2.0) for the
 session-thread model; CoffeeRDP (Apache-2.0) was reviewed.

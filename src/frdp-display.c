@@ -104,7 +104,8 @@ enum
   PROP_SCALING,
   PROP_ALLOW_RESIZE,
   PROP_RESIZE_SUPPORTED,
-  PROP_DOMAIN
+  PROP_DOMAIN,
+  PROP_KEYBOARD_LAYOUT
 };
 
 enum
@@ -422,6 +423,14 @@ frdp_display_get_property (GObject      *object,
         g_object_get (session, "domain", &str_property, NULL);
         g_value_take_string (value, str_property);
         break;
+      case PROP_KEYBOARD_LAYOUT:
+        {
+          guint layout = 0;
+
+          g_object_get (session, "keyboard-layout", &layout, NULL);
+          g_value_set_uint (value, layout);
+        }
+        break;
       case PROP_SCALING:
         g_object_get (session, "scaling", &str_property, NULL);
         g_value_set_boolean (value, (gboolean)GPOINTER_TO_INT (str_property));
@@ -458,6 +467,9 @@ frdp_display_set_property (GObject      *object,
         break;
       case PROP_DOMAIN:
         g_object_set (session, "domain", g_value_get_string (value), NULL);
+        break;
+      case PROP_KEYBOARD_LAYOUT:
+        g_object_set (session, "keyboard-layout", g_value_get_uint (value), NULL);
         break;
       case PROP_SCALING:
         frdp_display_set_scaling (self, g_value_get_boolean (value));
@@ -549,6 +561,25 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                         "domain",
                                                         NULL,
                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
+
+  /**
+   * FrdpDisplay:keyboard-layout:
+   *
+   * RDP keyboard layout ID announced to the server (a Windows keyboard
+   * layout identifier, e.g. `0x00000409` US, `0x00000407` German,
+   * `0x00000429` Persian). 0, the default, detects the local layout when
+   * connecting: the active layout on Windows, GNOME's input sources, the
+   * GTK keyboard device (GTK 4.18+), KDE's configuration, XKB_DEFAULT_LAYOUT,
+   * then the system language. Takes effect on the next
+   * [method@GtkFrdp.Display.open_host].
+   */
+  g_object_class_install_property (gobject_class,
+                                   PROP_KEYBOARD_LAYOUT,
+                                   g_param_spec_uint ("keyboard-layout",
+                                                      "keyboard-layout",
+                                                      "RDP keyboard layout ID, 0 to detect",
+                                                      0, G_MAXUINT32, 0,
+                                                      G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
 
   /**
    * FrdpDisplay:scaling:

@@ -24,5 +24,9 @@ First release as a standalone GTK 4 library, derived from gtk-frdp
   prompt answered from its signal handler hung; a hidden widget stopped
   processing network events.
 - The remote cursor is scaled together with the desktop.
+- Keyboard layout detection beyond GNOME: Windows, the GTK keyboard device
+  (GTK 4.18+, any desktop), KDE, XKB_DEFAULT_LAYOUT and the system locale,
+  using FreeRDP's XKB layout table; new `keyboard-layout` property to set
+  it explicitly. Persian (`ir`) maps to Windows' default Persian layout.
 - New: test suite (no server needed, plus an optional live suite), API
   reference (gi-docgen), C and Python example viewers.

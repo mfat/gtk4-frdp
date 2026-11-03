@@ -16,6 +16,8 @@ private_sources = [
   'frdp-session.c',
   'frdp-channel.c',
   'frdp-channel-display-control.c',
+  'frdp-keyboard-layout.c',
+  'frdp-xkb-layout-ids.c',
 ]
 
 header_subdir = 'gtk4-frdp'

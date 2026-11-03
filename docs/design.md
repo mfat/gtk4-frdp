@@ -114,6 +114,5 @@ All tests need a display; run them with `xvfb-run -a meson test`.
 - No clipboard yet: the GTK 3 clipboard channel from gtk-frdp is kept in
   the tree but not built; it needs porting to `GdkClipboard` and the
   session thread.
-- Keyboard layout detection reads GNOME settings (Linux).
 - macOS and Windows builds are written for (key codes, event handles) but
   not yet tested.
