@@ -26,6 +26,12 @@ for name in ("rdp-error", "rdp-auth-failure"):
     display.connect(name, lambda d, m, n=name: print(f"{time.monotonic() - start:.2f}s {n}: {m}", flush=True))
 display.open_host("127.0.0.1", 1)
 print(f"open_host returned after {time.monotonic() - start:.2f}s", flush=True)
+# A second widget: is the first call's cost one-time initialisation?
+second = GtkFrdp.Display()
+t1 = time.monotonic()
+second.open_host("127.0.0.1", 1)
+print(f"second open_host returned after {time.monotonic() - t1:.2f}s", flush=True)
+
 loop = GLib.MainLoop()
 GLib.timeout_add_seconds(int(sys.argv[1]) if len(sys.argv) > 1 else 15, loop.quit)
 loop.run()
