@@ -5,10 +5,15 @@
 # Tests exit 77 (reported as SKIP) when no display or no server is available.
 
 test_env = environment()
-test_env.prepend('LD_LIBRARY_PATH', meson.project_build_root() / 'src')
 test_env.prepend('GI_TYPELIB_PATH', meson.project_build_root() / 'src')
-test_env.set('GDK_BACKEND', 'x11')
-test_env.set('GSK_RENDERER', 'cairo')
+if host_machine.system() == 'windows'
+  # the DLL is found through PATH on Windows
+  test_env.prepend('PATH', meson.project_build_root() / 'src')
+else
+  test_env.prepend('LD_LIBRARY_PATH', meson.project_build_root() / 'src')
+  test_env.set('GDK_BACKEND', 'x11')   # headless runs use Xvfb
+  test_env.set('GSK_RENDERER', 'cairo')
+endif
 
 test_header = executable('test-header', 'test-header.c',
   dependencies: gtk4_frdp_dep,

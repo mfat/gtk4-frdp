@@ -57,6 +57,19 @@ test_from_description (void)
   g_assert_false (frdp_keyboard_layout_xkb_from_description ("No Such Keyboard", &l, &v));
 }
 
+#ifdef G_OS_WIN32
+/* On Windows the active input layout is authoritative and comes first. */
+static void
+test_detect_windows (void)
+{
+  const char *source = NULL;
+  guint32     id = frdp_keyboard_layout_detect (&source);
+
+  g_assert_cmpstr (source, ==, "windows");
+  g_assert_cmphex (id, !=, 0);
+}
+#endif
+
 static void
 test_detect_environment (void)
 {
@@ -145,10 +158,15 @@ main (int argc, char *argv[])
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/keyboard-layout/from-xkb", test_from_xkb);
   g_test_add_func ("/keyboard-layout/from-description", test_from_description);
+#ifdef G_OS_WIN32
+  g_test_add_func ("/keyboard-layout/detect-windows", test_detect_windows);
+#else
+  /* The desktop sources below are not consulted on Windows. */
   g_test_add_func ("/keyboard-layout/detect-gnome", test_detect_gnome);
   g_test_add_func ("/keyboard-layout/detect-kde", test_detect_kde);
   g_test_add_func ("/keyboard-layout/detect-environment", test_detect_environment);
   g_test_add_func ("/keyboard-layout/detect-fallback", test_detect_fallback);
+#endif
 
   return g_test_run ();
 }
