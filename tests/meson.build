@@ -9,6 +9,10 @@ test_env.prepend('GI_TYPELIB_PATH', meson.project_build_root() / 'src')
 if host_machine.system() == 'windows'
   # the DLL is found through PATH on Windows
   test_env.prepend('PATH', meson.project_build_root() / 'src')
+elif host_machine.system() == 'darwin'
+  # GTK's macOS backend; the CI runner has a window server
+  test_env.prepend('DYLD_LIBRARY_PATH', meson.project_build_root() / 'src')
+  test_env.set('GSK_RENDERER', 'cairo')
 else
   test_env.prepend('LD_LIBRARY_PATH', meson.project_build_root() / 'src')
   test_env.set('GDK_BACKEND', 'x11')   # headless runs use Xvfb
