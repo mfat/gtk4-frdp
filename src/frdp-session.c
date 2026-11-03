@@ -142,6 +142,8 @@ struct _FrdpSessionPrivate
   gchar        *domain;
   guint         port;
   guint         keyboard_layout;    /* 0 = detect */
+  gboolean      clipboard;
+  gboolean      audio_playback;
 
   /* ---- framebuffer: frame_lock ---- */
   GMutex        frame_lock;
@@ -188,7 +190,9 @@ enum
   PROP_SCALING,
   PROP_MONITOR_LAYOUT_SUPPORTED,
   PROP_DOMAIN,
-  PROP_KEYBOARD_LAYOUT
+  PROP_KEYBOARD_LAYOUT,
+  PROP_CLIPBOARD,
+  PROP_AUDIO_PLAYBACK
 };
 
 enum
@@ -1286,7 +1290,10 @@ frdp_session_init_freerdp (FrdpSession *self)
   freerdp_settings_set_bool (settings, FreeRDP_SupportDisplayControl, TRUE);
   freerdp_settings_set_bool (settings, FreeRDP_RemoteFxCodec, TRUE);
   freerdp_settings_set_uint32 (settings, FreeRDP_ColorDepth, 32);
-  freerdp_settings_set_bool (settings, FreeRDP_RedirectClipboard, TRUE);
+  /* FreeRDP's add-in loader turns these into the cliprdr / rdpsnd channels;
+   * rdpsnd plays the audio itself (PulseAudio, ALSA, ...). */
+  freerdp_settings_set_bool (settings, FreeRDP_RedirectClipboard, priv->clipboard);
+  freerdp_settings_set_bool (settings, FreeRDP_AudioPlayback, priv->audio_playback);
   freerdp_settings_set_bool (settings, FreeRDP_SupportGraphicsPipeline, TRUE);
 
   freerdp_client_add_dynamic_channel (settings, count, collections);
@@ -1523,6 +1530,12 @@ frdp_session_get_property (GObject    *object,
       case PROP_KEYBOARD_LAYOUT:
         g_value_set_uint (value, self->priv->keyboard_layout);
         break;
+      case PROP_CLIPBOARD:
+        g_value_set_boolean (value, self->priv->clipboard);
+        break;
+      case PROP_AUDIO_PLAYBACK:
+        g_value_set_boolean (value, self->priv->audio_playback);
+        break;
       case PROP_DISPLAY:
         g_value_set_object (value, self->priv->display);
         break;
@@ -1569,6 +1582,12 @@ frdp_session_set_property (GObject      *object,
         break;
       case PROP_KEYBOARD_LAYOUT:
         self->priv->keyboard_layout = g_value_get_uint (value);
+        break;
+      case PROP_CLIPBOARD:
+        self->priv->clipboard = g_value_get_boolean (value);
+        break;
+      case PROP_AUDIO_PLAYBACK:
+        self->priv->audio_playback = g_value_get_boolean (value);
         break;
       case PROP_DISPLAY:
         self->priv->display = g_value_get_object (value);
@@ -1672,6 +1691,14 @@ frdp_session_class_init (FrdpSessionClass *klass)
                                                       0, G_MAXUINT32, 0,
                                                       G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
 
+  g_object_class_install_property (gobject_class, PROP_CLIPBOARD,
+                                   g_param_spec_boolean ("clipboard", NULL, NULL, TRUE,
+                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_AUDIO_PLAYBACK,
+                                   g_param_spec_boolean ("audio-playback", NULL, NULL, FALSE,
+                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
+
   g_object_class_install_property (gobject_class,
                                    PROP_DISPLAY,
                                    g_param_spec_object ("display",
@@ -1736,6 +1763,7 @@ frdp_session_init (FrdpSession *self)
   self->priv->is_connected = FALSE;
   self->priv->scale = 1.0;
   self->priv->cursor_scale_applied = 1.0;
+  self->priv->clipboard = TRUE;
 }
 
 FrdpSession*

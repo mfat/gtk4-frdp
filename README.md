@@ -82,7 +82,7 @@ Complete viewers with a certificate dialog and a login prompt are in
 | `open_host(host, port)` | connect (asynchronous) |
 | `close()` | disconnect or cancel (asynchronous) |
 | `is_open()` | whether a session is established |
-| properties | `username`, `password` (write-only), `domain`, `keyboard-layout` (0 = detect), `scaling`, `allow-resize`, `resize-supported` (read-only) |
+| properties | `username`, `password` (write-only), `domain`, `keyboard-layout` (0 = detect), `clipboard`, `audio-playback`, `scaling`, `allow-resize`, `resize-supported` (read-only) |
 | signals | `rdp-connected`, `rdp-disconnected`, `rdp-error`, `rdp-auth-failure`, `rdp-needs-certificate-verification`, `rdp-needs-certificate-change-verification`, `rdp-needs-authentication` |
 | answering prompts | `certificate_verify_ex_finish()`, `certificate_change_verify_ex_finish()`, `authenticate_finish()` |
 

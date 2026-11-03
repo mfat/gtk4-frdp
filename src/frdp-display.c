@@ -105,7 +105,9 @@ enum
   PROP_ALLOW_RESIZE,
   PROP_RESIZE_SUPPORTED,
   PROP_DOMAIN,
-  PROP_KEYBOARD_LAYOUT
+  PROP_KEYBOARD_LAYOUT,
+  PROP_CLIPBOARD,
+  PROP_AUDIO_PLAYBACK
 };
 
 enum
@@ -431,6 +433,15 @@ frdp_display_get_property (GObject      *object,
           g_value_set_uint (value, layout);
         }
         break;
+      case PROP_CLIPBOARD:
+      case PROP_AUDIO_PLAYBACK:
+        {
+          gboolean enabled = FALSE;
+
+          g_object_get (session, pspec->name, &enabled, NULL);
+          g_value_set_boolean (value, enabled);
+        }
+        break;
       case PROP_SCALING:
         g_object_get (session, "scaling", &str_property, NULL);
         g_value_set_boolean (value, (gboolean)GPOINTER_TO_INT (str_property));
@@ -470,6 +481,10 @@ frdp_display_set_property (GObject      *object,
         break;
       case PROP_KEYBOARD_LAYOUT:
         g_object_set (session, "keyboard-layout", g_value_get_uint (value), NULL);
+        break;
+      case PROP_CLIPBOARD:
+      case PROP_AUDIO_PLAYBACK:
+        g_object_set (session, pspec->name, g_value_get_boolean (value), NULL);
         break;
       case PROP_SCALING:
         frdp_display_set_scaling (self, g_value_get_boolean (value));
@@ -580,6 +595,30 @@ frdp_display_class_init (FrdpDisplayClass *klass)
                                                       "RDP keyboard layout ID, 0 to detect",
                                                       0, G_MAXUINT32, 0,
                                                       G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
+
+  /**
+   * FrdpDisplay:clipboard:
+   *
+   * Whether the clipboard is shared with the remote session (text, images,
+   * HTML in both directions). On by default. Takes effect on the next
+   * [method@GtkFrdp.Display.open_host].
+   */
+  g_object_class_install_property (gobject_class, PROP_CLIPBOARD,
+                                   g_param_spec_boolean ("clipboard", "clipboard",
+                                                         "Share the clipboard", TRUE,
+                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
+
+  /**
+   * FrdpDisplay:audio-playback:
+   *
+   * Whether remote audio is played locally. FreeRDP's rdpsnd client plays
+   * it through the system's audio stack (PulseAudio, PipeWire, ALSA, ...).
+   * Off by default. Takes effect on the next [method@GtkFrdp.Display.open_host].
+   */
+  g_object_class_install_property (gobject_class, PROP_AUDIO_PLAYBACK,
+                                   g_param_spec_boolean ("audio-playback", "audio-playback",
+                                                         "Play remote audio locally", FALSE,
+                                                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE));
 
   /**
    * FrdpDisplay:scaling:
