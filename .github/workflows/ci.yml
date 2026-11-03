@@ -100,6 +100,25 @@ jobs:
           name: testlog-macos
           path: _build/meson-logs/testlog.txt
 
+      # Where does a refused connection get stuck? Debug log plus a sample of
+      # every thread while it waits.
+      - name: Diagnose (refused connection)
+        if: failure()
+        env:
+          GI_TYPELIB_PATH: ${{ github.workspace }}/_build/src
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/_build/src
+          WLOG_LEVEL: DEBUG
+        run: |
+          python3 tests/diag/refused-probe.py 15 > probe.log 2>&1 &
+          pid=$!
+          sleep 8
+          sample "$pid" 3 -file sample.txt >/dev/null 2>&1 || true
+          wait "$pid" || true
+          echo "=== probe output (signals and FreeRDP core/transport/nego)"
+          grep -E "^[0-9.]+s |open_host|done after|com.freerdp.(core|crypto)" probe.log | head -150
+          echo "=== threads"
+          sed -n '/^Call graph:/,/^Total number in stack/p' sample.txt | head -400
+
   windows-gvsbuild:
     # Visual Studio build against gvsbuild's GTK, for apps that ship gvsbuild
     # GTK with python.org Python (sshPilot's Windows installer). Produces the
