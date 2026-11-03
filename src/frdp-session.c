@@ -1261,6 +1261,13 @@ frdp_session_init_freerdp (FrdpSession *self)
   freerdp_settings_set_string (settings, FreeRDP_Password, priv->password);
   freerdp_settings_set_string (settings, FreeRDP_Domain, priv->domain);
 
+  /* Without INFO_AUTOLOGON Windows authenticates the connection (NLA) and
+   * then stops at its own logon screen; some hosts draw that black and drop
+   * the session after ~55 s (ERRINFO_RPC_INITIATED_DISCONNECT). FreeRDP's
+   * own clients never set it; Remmina does when a password is known. */
+  if (priv->password != NULL && *priv->password != '\0')
+    freerdp_settings_set_bool (settings, FreeRDP_AutoLogonEnabled, TRUE);
+
   freerdp_settings_set_bool (settings, FreeRDP_AllowFontSmoothing, TRUE);
   freerdp_settings_set_bool (settings, FreeRDP_AllowUnanouncedOrdersFromServer, TRUE);
 

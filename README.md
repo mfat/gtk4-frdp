@@ -20,7 +20,8 @@ gtk4-frdp is derived from GNOME's GTK 3 library
 [gtk-frdp](https://gitlab.gnome.org/GNOME/gtk-frdp). See [NOTICE](NOTICE)
 for what changed.
 
-> Status: 0.1 — works on Linux (tested against a Windows 10 Pro host).
+> Status: 0.1 — works on Linux (tested against Windows 10 Pro and Windows 11
+> hosts).
 > Windows (MSYS2) builds and passes the non-server tests in CI; a live
 > session on Windows has not been tested yet. macOS is untested. The API may still
 > change before 1.0.

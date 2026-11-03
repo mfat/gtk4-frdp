@@ -25,6 +25,9 @@ First release as a standalone GTK 4 library, derived from gtk-frdp
   never freed; use-after-free after a failed connection; a certificate
   prompt answered from its signal handler hung; a hidden widget stopped
   processing network events.
+- Logs in directly when a password is given (auto-logon), instead of
+  stopping at Windows' own logon screen; some Windows 11 hosts showed a
+  black screen and dropped the session after ~55 s without it.
 - The remote cursor is scaled together with the desktop.
 - Keyboard layout detection beyond GNOME: Windows, the GTK keyboard device
   (GTK 4.18+, any desktop), KDE, XKB_DEFAULT_LAYOUT and the system locale,
