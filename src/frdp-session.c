@@ -103,6 +103,7 @@ struct _FrdpSessionPrivate
   double offset_y;
 
   guint update_id;
+  guint close_idle_id;
 
   gboolean is_connected;
 
@@ -523,6 +524,9 @@ frdp_certificate_verify_ex (freerdp     *freerdp_session,
 {
   FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
 
+  if (self->priv->display == NULL)
+    return 0; /* widget gone: refuse */
+
   return frdp_display_certificate_verify_ex (FRDP_DISPLAY (self->priv->display),
                                              host,
                                              port,
@@ -548,6 +552,9 @@ frdp_changed_certificate_verify_ex (freerdp     *freerdp_session,
 {
   FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
 
+  if (self->priv->display == NULL)
+    return 0; /* widget gone: refuse */
+
   return frdp_display_certificate_change_verify_ex (FRDP_DISPLAY (self->priv->display),
                                                     host,
                                                     port,
@@ -569,6 +576,9 @@ frdp_authenticate_ex (freerdp          *freerdp_session,
                       rdp_auth_reason   reason)
 {
   FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
+
+  if (self->priv->display == NULL)
+    return 0; /* widget gone: refuse */
 
   return frdp_display_authenticate (FRDP_DISPLAY (self->priv->display),
                                     username,
@@ -807,6 +817,15 @@ idle_close (gpointer user_data)
 
   gboolean was_open = self->priv->is_connected || self->priv->freerdp_session != NULL;
 
+  if (self->priv->close_idle_id != 0) {
+    guint id = self->priv->close_idle_id;
+
+    /* Removing it drops the idle's reference; we are not the last holder
+     * (finalize cannot run while the idle still owns one). */
+    self->priv->close_idle_id = 0;
+    g_source_remove (id);
+  }
+
   self->priv->is_connected = FALSE;
 
   if (self->priv->update_id > 0) {
@@ -845,6 +864,33 @@ idle_close (gpointer user_data)
   g_debug ("RDP client disconnected");
 
   return FALSE;
+}
+
+static gboolean
+idle_close_cb (gpointer user_data)
+{
+  FrdpSession *self = user_data;
+
+  self->priv->close_idle_id = 0;
+  idle_close (self);
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Upstream queued idle_close() with a bare pointer. Once the widget (and
+ * with it the session) is actually freed, the queued close ran on freed
+ * memory: Gtk-CRITICAL + free(): invalid pointer after a failed connect.
+ * The idle now owns a reference, and only one close is ever pending. */
+static void
+frdp_session_schedule_close (FrdpSession *self)
+{
+  if (self->priv->close_idle_id != 0)
+    return;
+
+  self->priv->close_idle_id = g_idle_add_full (G_PRIORITY_DEFAULT_IDLE,
+                                               idle_close_cb,
+                                               g_object_ref (self),
+                                               g_object_unref);
 }
 
 /*
@@ -977,7 +1023,7 @@ frdp_event_source_dispatch (GSource *source, GSourceFunc callback, gpointer user
 
   if (freerdp_shall_disconnect_context (priv->freerdp_session->context)) {
     priv->update_id = 0;
-    g_idle_add ((GSourceFunc) idle_close, self);
+    frdp_session_schedule_close (self);
     return G_SOURCE_REMOVE;
   }
 
@@ -1326,7 +1372,7 @@ frdp_session_connect_thread (GTask        *task,
                      "Failed to initialize RDP!");
     }
 
-    g_idle_add ((GSourceFunc) idle_close, self);
+    frdp_session_schedule_close (self);
     g_task_return_boolean (task, FALSE);
 
     return;
@@ -1366,7 +1412,7 @@ frdp_session_connect_thread (GTask        *task,
             break;
     }
 
-    g_idle_add ((GSourceFunc) idle_close, self);
+    frdp_session_schedule_close (self);
     g_task_return_boolean (task, FALSE);
 
     return;

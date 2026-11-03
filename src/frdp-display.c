@@ -445,6 +445,9 @@ frdp_display_dispose (GObject *object)
    * FreeRDP context and framebuffer. */
   if (priv->session != NULL) {
     g_signal_handlers_disconnect_by_data (priv->session, self);
+    /* A pending deferred close keeps the session alive past this widget;
+     * make sure it can never reach back into a disposed display. */
+    g_object_set (priv->session, "display", NULL, NULL);
     frdp_session_close (priv->session);
     g_clear_object (&priv->session);
   }
