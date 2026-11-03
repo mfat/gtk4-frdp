@@ -2,6 +2,8 @@
  *
  * Copyright (C) 2018 Felipe Borges <felipeborges@gnome.org>
  *
+ * GTK4 port for the sshPilot embedded-RDP spike (2026).
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -24,13 +26,13 @@ G_BEGIN_DECLS
 
 #define FRDP_TYPE_DISPLAY (frdp_display_get_type())
 
-G_DECLARE_DERIVABLE_TYPE (FrdpDisplay, frdp_display, FRDP, DISPLAY, GtkDrawingArea)
+G_DECLARE_DERIVABLE_TYPE (FrdpDisplay, frdp_display, FRDP, DISPLAY, GtkWidget)
 
 typedef struct _FrdpDisplayPrivate FrdpDisplayPrivate;
 
 struct _FrdpDisplayClass
 {
-  GtkDrawingAreaClass parent_parent;
+  GtkWidgetClass parent_class;
 
   gboolean (*authenticate) (FrdpDisplay *self, gchar **username, gchar **password, gchar **domain);
 };
@@ -86,7 +88,5 @@ void       frdp_display_authenticate_finish (FrdpDisplay *self,
                                              gchar       *domain);
 
 gboolean   frdp_display_is_keyboard_grabbed (FrdpDisplay *self);
-
-GdkPixbuf *frdp_display_get_pixbuf (FrdpDisplay *display);
 
 G_END_DECLS

@@ -46,9 +46,30 @@
 #include "frdp-session.h"
 #include "frdp-context.h"
 #include "frdp-channel-display-control.h"
+#ifdef FRDP_WITH_CLIPBOARD
 #include "frdp-channel-clipboard.h"
+#endif
 
 #define SELECT_TIMEOUT 20
+
+/* Spike instrumentation: FRDP_SPIKE_STATS=1 prints loop/frame rates every 5 s. */
+static struct { guint loops, timeouts, signaled, uploads; gint64 since; } spike_stats;
+
+static void
+spike_stats_tick (void)
+{
+  gint64 now = g_get_monotonic_time ();
+
+  if (spike_stats.since == 0)
+    spike_stats.since = now;
+  if (now - spike_stats.since >= 5 * G_USEC_PER_SEC) {
+    if (g_getenv ("FRDP_SPIKE_STATS") != NULL)
+      g_printerr ("frdp-stats: per 5s dispatches=%u unused=%u draws_queued=%u texture_uploads=%u\n",
+                  spike_stats.loops, spike_stats.timeouts, spike_stats.signaled, spike_stats.uploads);
+    memset (&spike_stats, 0, sizeof spike_stats);
+    spike_stats.since = now;
+  }
+}
 #define FRDP_CONNECTION_THREAD_MAX_ERRORS 10
 
 #ifdef HAVE_FREERDP3
@@ -60,7 +81,7 @@
 struct frdp_pointer
 {
 	rdpPointer pointer;
-	cairo_surface_t *data;
+	GdkTexture *texture;
 };
 typedef struct frdp_pointer frdpPointer;
 
@@ -69,8 +90,13 @@ struct _FrdpSessionPrivate
   freerdp      *freerdp_session;
 
   GtkWidget    *display;
-  cairo_surface_t *surface;
-  cairo_format_t cairo_format;
+  /* GTK4: the framebuffer is uploaded as an immutable texture per frame
+   * instead of wrapping gdi->primary_buffer in a cairo surface. */
+  GdkTexture   *frame;
+  gboolean      frame_dirty;
+  guint         resize_timeout_id;
+  int           alloc_width;
+  int           alloc_height;
   gboolean scaling;
   double scale;
   double offset_x;
@@ -92,11 +118,10 @@ struct _FrdpSessionPrivate
 
   /* Channels */
   FrdpChannelDisplayControl *display_control_channel;
+#ifdef FRDP_WITH_CLIPBOARD
   FrdpChannelClipboard      *clipboard_channel;
+#endif
   gboolean                   monitor_layout_supported;
-
-  GQueue *area_draw_queue;  /* elem: GdkRectangle */
-  GMutex  area_draw_mutex;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (FrdpSession, frdp_session, G_TYPE_OBJECT)
@@ -126,78 +151,32 @@ enum
 
 static guint signals[LAST_SIGNAL];
 
-static void queue_draw_area (FrdpSession *self,
-                             gint         x,
-                             gint         y,
-                             gint         width,
-                             gint         height);
-
 static void
 frdp_session_update_mouse_pointer (FrdpSession  *self)
 {
   FrdpSessionPrivate *priv = self->priv;
   GdkCursor *cursor;
-  GdkDisplay *display;
-  GdkWindow  *window;
 
-  window = gtk_widget_get_window (priv->display);
-  if (window == NULL)
+  if (priv->display == NULL)
     return;
 
-  display = gtk_widget_get_display(priv->display);
   if (priv->show_cursor && priv->cursor_null) {
-    cairo_surface_t *surface;
-    cairo_t *cairo;
-
-    /* Create a 1x1 image with transparent color */
-    surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 1, 1);
-    cairo = cairo_create (surface);
-    cairo_set_source_rgba (cairo, 0.0, 0.0, 0.0, 0.0);
-    cairo_set_line_width(cairo, 1);
-    cairo_rectangle(cairo, 0, 0, 1, 1);
-    cairo_fill (cairo);
-
-    cursor =  gdk_cursor_new_from_surface (display, surface, 0, 0);
-    cairo_surface_destroy (surface);
-    cairo_destroy (cairo);
-  } else if (!priv->show_cursor || !priv->cursor) {
-      /* No cursor set or none to show */
-    cursor = gdk_cursor_new_from_name (display, "default");
+    /* Server hides the pointer. */
+    cursor = gdk_cursor_new_from_name ("none", NULL);
+  } else if (!priv->show_cursor || !priv->cursor || !priv->cursor->texture) {
+    /* No cursor set or none to show */
+    cursor = gdk_cursor_new_from_name ("default", NULL);
   } else {
-    rdpPointer *pointer = &priv->cursor->pointer;
-    int window_scale_factor = gdk_window_get_scale_factor (window);
-    double x = priv->cursor->pointer.xPos * priv->scale;
-    double y = priv->cursor->pointer.yPos * priv->scale;
-    double w = ceil (pointer->width * priv->scale) * window_scale_factor;
-    double h = ceil (pointer->height * priv->scale) * window_scale_factor;
-    cairo_surface_t *surface;
-    cairo_t *cairo;
-
-    if (!self->priv->scaling) {
-      self->priv->scale = 1.0;
-    }
-
-    /* Scale the source image according to current settings. */
-    surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, w, h);
-    cairo = cairo_create (surface);
-
-    cairo_scale (cairo,
-                 self->priv->scale * window_scale_factor,
-                 self->priv->scale * window_scale_factor);
-    cairo_set_source_surface (cairo, priv->cursor->data, 0, 0);
-    cairo_paint (cairo);
-
-    cairo_fill (cairo);
-    /* Set device scale to prevent GDK from scaling again based on HiDPI */
-    cairo_surface_set_device_scale (surface,
-                                    window_scale_factor,
-                                    window_scale_factor);
-    cursor = gdk_cursor_new_from_surface (display, surface, x, y);
-    cairo_surface_destroy (surface);
-    cairo_destroy (cairo);
+    /* GTK4 scales cursor textures for the surface scale itself; the
+     * remote-desktop scale factor is not applied here (spike scope). */
+    cursor = gdk_cursor_new_from_texture (priv->cursor->texture,
+                                          priv->cursor->pointer.xPos,
+                                          priv->cursor->pointer.yPos,
+                                          NULL);
   }
 
-  gdk_window_set_cursor (window, cursor);
+  gtk_widget_set_cursor (priv->display, cursor);
+  g_clear_object (&cursor);
 }
 
 static BOOL
@@ -206,35 +185,18 @@ frdp_pointer_new (rdpContext *context,
 {
   frdpContext *fcontext = (frdpContext *) context;
   frdpPointer *fpointer = (frdpPointer *) pointer;
-  int stride;
-  unsigned char *data;
-  cairo_surface_t *surface;
+  gsize        stride;
+  guint8      *data;
+  GBytes      *bytes;
 
-  if (fcontext == NULL || fpointer == NULL)
+  if (fcontext == NULL || fpointer == NULL || pointer->width == 0 || pointer->height == 0)
     return FALSE;
 
-  surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
-                                        pointer->width,
-                                        pointer->height);
-  if (surface == NULL)
-    return FALSE;
+  stride = (gsize) pointer->width * 4;
+  /* Zeroed: freerdp_image_copy_from_pointer_data does not initialise the
+   * buffer (FreeRDP issue 5061). */
+  data = g_malloc0 (stride * pointer->height);
 
-  { /* FreeRDP BUG https://github.com/FreeRDP/FreeRDP/issues/5061
-     * the function freerdp_image_copy_from_pointer_data
-     * does not initialize the buffer which results in broken alpha data. */
-    cairo_t *cairo = cairo_create (surface);
-
-    cairo_set_source_rgba (cairo, 0.0, 0.0, 0.0, 1.0);
-    cairo_fill (cairo);
-    cairo_paint (cairo);
-    cairo_destroy (cairo);
-  }
-
-  data = cairo_image_surface_get_data (surface);
-  if (data == NULL)
-    goto fail;
-
-  stride = cairo_format_stride_for_width (CAIRO_FORMAT_ARGB32, pointer->width);
   if (!freerdp_image_copy_from_pointer_data (data, PIXEL_FORMAT_BGRA32,
                                              stride, 0, 0, pointer->width,
                                              pointer->height,
@@ -243,18 +205,18 @@ frdp_pointer_new (rdpContext *context,
                                              pointer->andMaskData,
                                              pointer->lengthAndMask,
                                              pointer->xorBpp,
-                                             &context->gdi->palette))
-    goto fail;
+                                             &context->gdi->palette)) {
+    g_free (data);
+    return FALSE;
+  }
 
-  fpointer->data = surface;
+  bytes = g_bytes_new_take (data, stride * pointer->height);
+  fpointer->texture = gdk_memory_texture_new (pointer->width, pointer->height,
+                                              GDK_MEMORY_B8G8R8A8,
+                                              bytes, stride);
+  g_bytes_unref (bytes);
 
   return TRUE;
-
-fail:
-  if (surface != NULL)
-    cairo_surface_destroy (surface);
-
-  return FALSE;
 }
 
 static void
@@ -263,10 +225,8 @@ frdp_pointer_free (rdpContext *context,
 {
   frdpPointer *fpointer = (frdpPointer *) pointer;
 
-  if (fpointer != NULL && fpointer->data != NULL) {
-    cairo_surface_destroy (fpointer->data);
-    fpointer->data = NULL;
-  }
+  if (fpointer != NULL)
+    g_clear_object (&fpointer->texture);
 }
 
 static BOOL
@@ -336,47 +296,61 @@ frdp_register_pointer (rdpGraphics *graphics)
   graphics_register_pointer (graphics, &pointer);
 }
 
-static guint32
-frdp_session_get_best_color_depth (FrdpSession *self)
+static rdpGdi *
+frdp_session_get_gdi (FrdpSession *self)
 {
-  GdkScreen *display;
-  GdkVisual *visual;
+  FrdpSessionPrivate *priv = self->priv;
 
-  display = gdk_screen_get_default ();
-  visual = gdk_screen_get_rgba_visual (display);
+  if (priv->freerdp_session == NULL || priv->freerdp_session->context == NULL)
+    return NULL;
 
-  return gdk_visual_get_depth (visual);
+  return priv->freerdp_session->context->gdi;
+}
+
+/* Scale/offset used both for drawing and for mapping pointer coordinates. */
+static void
+frdp_session_update_scale (FrdpSession *self)
+{
+  FrdpSessionPrivate *priv = self->priv;
+  rdpGdi             *gdi = frdp_session_get_gdi (self);
+  double              width = priv->alloc_width, height = priv->alloc_height;
+  double              widget_ratio, server_ratio;
+
+  if (gdi == NULL || gdi->width == 0 || gdi->height == 0 || !priv->scaling ||
+      width <= 0 || height <= 0) {
+    priv->scale = 1.0;
+    priv->offset_x = priv->offset_y = 0.0;
+    return;
+  }
+
+  widget_ratio = width / height;
+  server_ratio = (double) gdi->width / gdi->height;
+
+  if (widget_ratio > server_ratio)
+    priv->scale = height / gdi->height;
+  else
+    priv->scale = width / gdi->width;
+
+  priv->offset_x = (width - gdi->width * priv->scale) / 2.0;
+  priv->offset_y = (height - gdi->height * priv->scale) / 2.0;
 }
 
 static void
-create_cairo_surface (FrdpSession *self)
+frdp_session_update_size_request (FrdpSession *self)
 {
   FrdpSessionPrivate *priv = self->priv;
-  rdpGdi             *gdi;
-  gint                stride;
+  rdpGdi             *gdi = frdp_session_get_gdi (self);
+  gboolean            allow_resize = FALSE;
 
-  if (priv->surface != NULL) {
-    cairo_surface_mark_dirty (priv->surface);
-    cairo_surface_destroy (priv->surface);
-    self->priv->surface = NULL;
-  }
+  if (priv->display == NULL)
+    return;
 
-  gdi = priv->freerdp_session->context->gdi;
+  g_object_get (G_OBJECT (priv->display), "allow-resize", &allow_resize, NULL);
 
-  if (priv->scaling)
+  if (priv->scaling || allow_resize || gdi == NULL)
     gtk_widget_set_size_request (priv->display, -1, -1);
   else
-    gtk_widget_set_size_request (priv->display,
-                                 gdi->width,
-                                 gdi->height);
-  stride = cairo_format_stride_for_width (priv->cairo_format, gdi->width);
-  self->priv->surface =
-      cairo_image_surface_create_for_data ((unsigned char*) gdi->primary_buffer,
-                                           priv->cairo_format,
-                                           gdi->width,
-                                           gdi->height,
-                                           stride);
-  cairo_surface_flush (priv->surface);
+    gtk_widget_set_size_request (priv->display, gdi->width, gdi->height);
 }
 
 static gboolean
@@ -388,7 +362,9 @@ frdp_desktop_resize (rdpContext *context)
   if (gdi_resize (gdi,
                   freerdp_settings_get_uint32 (context->settings, FreeRDP_DesktopWidth),
                   freerdp_settings_get_uint32 (context->settings, FreeRDP_DesktopHeight))) {
-    create_cairo_surface (self);
+    frdp_session_update_size_request (self);
+    frdp_session_update_scale (self);
+    self->priv->frame_dirty = TRUE;
     return TRUE;
   } else {
     return FALSE;
@@ -396,72 +372,71 @@ frdp_desktop_resize (rdpContext *context)
 }
 
 static void
-frdp_session_configure_event (GtkWidget *widget,
-                              GdkEvent  *event,
-                              gpointer   user_data)
+frdp_session_request_remote_resize (FrdpSession *self)
 {
-  FrdpSession *self = (FrdpSession*) user_data;
   FrdpSessionPrivate *priv = self->priv;
-  GtkWidget *scrolled;
-  rdpSettings *settings;
-  rdpGdi *gdi;
-  double width, height, widget_ratio, server_ratio;
-  gboolean allow_resize;
-  guint32 desktop_width, desktop_height;
+  rdpSettings        *settings;
+  guint32             request_width, request_height;
 
-  if (priv->freerdp_session == NULL)
-    return;
-
-  gdi = priv->freerdp_session->context->gdi;
-  if (priv->surface == NULL) {
-    create_cairo_surface (self);
-  }
-
-  scrolled = gtk_widget_get_ancestor (widget, GTK_TYPE_SCROLLED_WINDOW);
-  width = (double)gtk_widget_get_allocated_width (scrolled);
-  height = (double)gtk_widget_get_allocated_height (scrolled);
-
-  if (priv->freerdp_session->context->settings == NULL)
+  if (priv->freerdp_session == NULL || priv->display_control_channel == NULL ||
+      priv->alloc_width <= 0 || priv->alloc_height <= 0)
     return;
 
   settings = priv->freerdp_session->context->settings;
-  desktop_width = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth);
-  desktop_height = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
+  request_width = priv->alloc_width;
+  request_height = priv->alloc_height;
 
-  g_object_get (G_OBJECT (widget), "allow-resize", &allow_resize, NULL);
+  /* Round width to even number */
+  if (request_width % 2 == 1)
+    request_width--;
 
-  if (allow_resize) {
-    guint32 request_width = width;
-    guint32 request_height = height;
+  /* Only request resize if the rounded dimensions differ from the current
+   * desktop size; prevents resize loops with odd dimensions. */
+  if (freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth) != request_width ||
+      freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight) != request_height)
+    frdp_channel_display_control_resize_display (priv->display_control_channel,
+                                                 request_width,
+                                                 request_height);
+}
 
-    /* Round width to even number */
-    if (request_width % 2 == 1)
-      request_width--;
+static gboolean
+frdp_session_resize_timeout (gpointer user_data)
+{
+  FrdpSession *self = user_data;
 
-    /* Only request resize if the rounded dimensions differ from current desktop size.
-     * This prevents infinite resize loops when the window has odd dimensions. */
-    if ((desktop_width != request_width || desktop_height != request_height) &&
-        priv->display_control_channel != NULL) {
-      frdp_channel_display_control_resize_display (priv->display_control_channel,
-                                                   request_width,
-                                                   request_height);
-    }
-  } else {
-    if (priv->scaling) {
-        widget_ratio = height > 0 ? width / height : 1.0;
-        server_ratio = desktop_height > 0 ? (double) desktop_width / desktop_height : 1.0;
+  self->priv->resize_timeout_id = 0;
+  frdp_session_request_remote_resize (self);
 
-        if (widget_ratio > server_ratio)
-          self->priv->scale = height / desktop_height;
-        else
-          self->priv->scale = width / desktop_width;
+  return G_SOURCE_REMOVE;
+}
 
-        self->priv->offset_x = (width - desktop_width * self->priv->scale) / 2.0;
-        self->priv->offset_y = (height - desktop_height * self->priv->scale) / 2.0;
-    } else {
-      gtk_widget_set_size_request (priv->display, gdi->width, gdi->height);
-    }
-  }
+/* Replaces the GTK3 "configure-event" handler. Uses the widget's own
+ * allocation instead of assuming a GtkScrolledWindow ancestor, and
+ * debounces remote resizes so a window drag does not renegotiate the
+ * monitor layout on every allocation. */
+void
+frdp_session_size_allocated (FrdpSession *self,
+                             int          width,
+                             int          height)
+{
+  FrdpSessionPrivate *priv = self->priv;
+  gboolean            allow_resize = FALSE;
+
+  priv->alloc_width = width;
+  priv->alloc_height = height;
+
+  frdp_session_update_scale (self);
+
+  if (priv->display == NULL || priv->freerdp_session == NULL)
+    return;
+
+  g_object_get (G_OBJECT (priv->display), "allow-resize", &allow_resize, NULL);
+  if (!allow_resize)
+    return;
+
+  if (priv->resize_timeout_id != 0)
+    g_source_remove (priv->resize_timeout_id);
+  priv->resize_timeout_id = g_timeout_add (200, frdp_session_resize_timeout, self);
 }
 
 static void
@@ -470,10 +445,7 @@ frdp_session_resize_supported_changed (FrdpDisplay *display,
                                        gpointer     user_data)
 {
   FrdpSession        *self = user_data;
-  FrdpSessionPrivate *priv = frdp_session_get_instance_private (self);
-  GtkWidget          *scrolled;
   gboolean            resize_supported, allow_resize;
-  gint                width, height;
 
   g_object_get (G_OBJECT (display),
                 "resize-supported", &resize_supported,
@@ -481,15 +453,7 @@ frdp_session_resize_supported_changed (FrdpDisplay *display,
                 NULL);
 
   if (resize_supported && allow_resize)
-    {
-      scrolled = gtk_widget_get_ancestor (GTK_WIDGET (display), GTK_TYPE_SCROLLED_WINDOW);
-      width = gtk_widget_get_allocated_width (scrolled);
-      height = gtk_widget_get_allocated_height (scrolled);
-
-      frdp_channel_display_control_resize_display (priv->display_control_channel,
-                                                   width,
-                                                   height);
-    }
+    frdp_session_request_remote_resize (self);
 }
 
 static void
@@ -497,36 +461,50 @@ frdp_session_set_scaling (FrdpSession *self,
                           gboolean     scaling)
 {
   self->priv->scaling = scaling;
+  frdp_session_update_scale (self);
+  frdp_session_update_size_request (self);
 }
 
-static gboolean
-frdp_session_draw (GtkWidget *widget,
-                   cairo_t   *cr,
-                   gpointer   user_data)
+/* Replaces the GTK3 "draw" handler. The framebuffer is copied into an
+ * immutable GdkMemoryTexture at most once per frame (only when FreeRDP
+ * painted since the last one), so GTK never reads a buffer FreeRDP is
+ * writing. */
+void
+frdp_session_snapshot (FrdpSession *self,
+                       GtkSnapshot *snapshot,
+                       int          width,
+                       int          height)
 {
-  FrdpSession *self = (FrdpSession*) user_data;
+  FrdpSessionPrivate *priv = self->priv;
+  rdpGdi             *gdi = frdp_session_get_gdi (self);
 
-  // Nothing to draw if disconnected
-  if (!self->priv->is_connected)
-    return FALSE;
+  if (!priv->is_connected || gdi == NULL || gdi->primary_buffer == NULL)
+    return;
 
-  if (self->priv->surface == NULL ||
-      (self->priv->freerdp_session->context->gdi->width != cairo_image_surface_get_width (self->priv->surface) ||
-       self->priv->freerdp_session->context->gdi->height != cairo_image_surface_get_height (self->priv->surface))) {
-    create_cairo_surface (self);
+  if (priv->frame == NULL || priv->frame_dirty ||
+      gdk_texture_get_width (priv->frame) != (int) gdi->width ||
+      gdk_texture_get_height (priv->frame) != (int) gdi->height) {
+    GBytes *bytes = g_bytes_new (gdi->primary_buffer, (gsize) gdi->stride * gdi->height);
+
+    g_clear_object (&priv->frame);
+    spike_stats.uploads++;
+    priv->frame = gdk_memory_texture_new (gdi->width, gdi->height,
+                                          GDK_MEMORY_B8G8R8X8,
+                                          bytes, gdi->stride);
+    g_bytes_unref (bytes);
+    priv->frame_dirty = FALSE;
   }
 
-  if (self->priv->scaling) {
-      cairo_translate (cr, self->priv->offset_x, self->priv->offset_y);
-      cairo_scale (cr, self->priv->scale, self->priv->scale);
+  if (priv->scaling) {
+    graphene_rect_t rect = GRAPHENE_RECT_INIT (priv->offset_x, priv->offset_y,
+                                               gdi->width * priv->scale,
+                                               gdi->height * priv->scale);
+    gtk_snapshot_append_scaled_texture (snapshot, priv->frame,
+                                        GSK_SCALING_FILTER_LINEAR, &rect);
+  } else {
+    graphene_rect_t rect = GRAPHENE_RECT_INIT (0, 0, gdi->width, gdi->height);
+    gtk_snapshot_append_texture (snapshot, priv->frame, &rect);
   }
-
-  cairo_set_source_surface (cr, self->priv->surface, 0, 0);
-  cairo_paint (cr);
-
-  frdp_display_set_scaling (FRDP_DISPLAY (self->priv->display), self->priv->scaling);
-
-  return TRUE;
 }
 
 /*
@@ -632,12 +610,14 @@ frdp_on_channel_connected_event_handler (void                                   
   } else if (strcmp (e->name, RAIL_SVC_CHANNEL_NAME) == 0) {
     // TODO Remote application
   } else if (strcmp (e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
+#ifdef FRDP_WITH_CLIPBOARD
     g_clear_object (&priv->clipboard_channel);
 
     priv->clipboard_channel = g_object_new (FRDP_TYPE_CHANNEL_CLIPBOARD,
                                             "session", session,
                                             "cliprdr-client-context", (CliprdrClientContext *) e->pInterface,
                                             NULL);
+#endif
   } else if (strcmp (e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0) {
     // TODO Multiparty channel
   } else if (strcmp (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
@@ -668,7 +648,9 @@ frdp_on_channel_disconnected_event_handler (void                                
   } else if (strcmp (e->name, RAIL_SVC_CHANNEL_NAME) == 0) {
     // TODO Remote application
   } else if (strcmp (e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
+#ifdef FRDP_WITH_CLIPBOARD
     g_clear_object (&priv->clipboard_channel);
+#endif
   } else if (strcmp (e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0) {
     // TODO Multiparty channel
   } else if (strcmp (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
@@ -746,60 +728,18 @@ frdp_begin_paint (rdpContext *context)
   return TRUE;
 }
 
-static void
-queue_draw_area (FrdpSession *self,
-                 gint x,
-                 gint y,
-                 gint width,
-                 gint height)
-{
-  FrdpSessionPrivate *priv = self->priv;
-  GdkRectangle       *rectangle;
-
-  rectangle = g_new (GdkRectangle, 1);
-  rectangle->x = x;
-  rectangle->y = y;
-  rectangle->width = width;
-  rectangle->height = height;
-
-  g_mutex_lock (&priv->area_draw_mutex);
-
-  if (priv->area_draw_queue != NULL)
-    g_queue_push_tail (priv->area_draw_queue, rectangle);
-
-  g_mutex_unlock (&priv->area_draw_mutex);
-}
-
+/* GTK4 has no partial invalidation; FreeRDP's GDI already tracks the dirty
+ * region, so a flag that makes the next snapshot re-upload is enough. */
 static gboolean
 frdp_end_paint (rdpContext *context)
 {
-  FrdpSessionPrivate *priv;
   FrdpSession *self = ((frdpContext *) context)->self;
   rdpGdi *gdi = context->gdi;
-  gint x, y, w, h;
-  gint pos_x, pos_y;
 
   if (gdi->primary->hdc->hwnd->invalid->null)
     return TRUE;
 
-  x = gdi->primary->hdc->hwnd->invalid->x;
-  y = gdi->primary->hdc->hwnd->invalid->y;
-  w = gdi->primary->hdc->hwnd->invalid->w;
-  h = gdi->primary->hdc->hwnd->invalid->h;
-
-  priv = self->priv;
-
-  if (priv->scaling) {
-    pos_x = self->priv->offset_x + x * priv->scale;
-    pos_y = self->priv->offset_y + y * priv->scale;
-    queue_draw_area (self,
-                     floor (pos_x),
-                     floor (pos_y),
-                     ceil (pos_x + w * priv->scale) - floor (pos_x),
-                     ceil (pos_y + h * priv->scale) - floor (pos_y));
-  } else {
-    queue_draw_area (self, x, y, w, h);
-  }
+  self->priv->frame_dirty = TRUE;
 
   return TRUE;
 }
@@ -810,32 +750,13 @@ frdp_post_connect (freerdp *freerdp_session)
   rdpSettings *settings;
   rdpContext *context;
   FrdpSession *self = ((frdpContext *) freerdp_session->context)->self;
-  guint32 color_format;
   ResizeWindowEventArgs e;
 
   context = freerdp_session->context;
   settings = context->settings;
-  switch (frdp_session_get_best_color_depth (self)) {
-    case 32:
-      color_format = PIXEL_FORMAT_BGRX32;
-      self->priv->cairo_format = CAIRO_FORMAT_ARGB32;
-      break;
-    case 24:
-      color_format = PIXEL_FORMAT_BGRX32;
-      self->priv->cairo_format = CAIRO_FORMAT_RGB24;
-      break;
-    case 16:
-    case 15:
-      color_format = PIXEL_FORMAT_BGR16;
-      self->priv->cairo_format = CAIRO_FORMAT_RGB16_565;
-      break;
-    default:
-      color_format = PIXEL_FORMAT_BGRX32;
-      self->priv->cairo_format = CAIRO_FORMAT_RGB16_565;
-      break;
-  }
 
-  gdi_init (freerdp_session, color_format);
+  /* GTK4 has no visuals to probe; GdkMemoryTexture takes 32-bit BGRX. */
+  gdi_init (freerdp_session, PIXEL_FORMAT_BGRX32);
 
   frdp_register_pointer (freerdp_session->context->graphics);
   freerdp_session->context->update->BeginPaint = frdp_begin_paint;
@@ -847,7 +768,9 @@ frdp_post_connect (freerdp *freerdp_session)
 	e.height = freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
 	PubSub_OnResizeWindow(context->pubSub, freerdp_session->context, &e);
 
-  create_cairo_surface (self);
+  frdp_session_update_size_request (self);
+  frdp_session_update_scale (self);
+  self->priv->frame_dirty = TRUE;
 
   return TRUE;
 }
@@ -863,9 +786,8 @@ frdp_post_disconnect (freerdp *instance)
 
   self = ((frdpContext *) instance->context)->self;
 
-  g_signal_handlers_disconnect_by_func (self->priv->display, G_CALLBACK (frdp_session_draw), self);
-  g_signal_handlers_disconnect_by_func (self->priv->display, G_CALLBACK (frdp_session_configure_event), self);
-  g_signal_handlers_disconnect_by_func (self->priv->display, G_CALLBACK (frdp_session_resize_supported_changed), self);
+  if (self->priv->display != NULL)
+    g_signal_handlers_disconnect_by_func (self->priv->display, G_CALLBACK (frdp_session_resize_supported_changed), self);
 
   context = instance->context;
   PubSub_UnsubscribeChannelConnected (context->pubSub,
@@ -883,6 +805,8 @@ idle_close (gpointer user_data)
 {
   FrdpSession *self = (FrdpSession*) user_data;
 
+  gboolean was_open = self->priv->is_connected || self->priv->freerdp_session != NULL;
+
   self->priv->is_connected = FALSE;
 
   if (self->priv->update_id > 0) {
@@ -890,15 +814,32 @@ idle_close (gpointer user_data)
     self->priv->update_id = 0;
   }
 
-  g_mutex_lock (&self->priv->area_draw_mutex);
-  g_queue_clear_full (self->priv->area_draw_queue, g_free);
-  g_mutex_unlock (&self->priv->area_draw_mutex);
-  g_mutex_clear (&self->priv->area_draw_mutex);
+  if (self->priv->resize_timeout_id > 0) {
+    g_source_remove (self->priv->resize_timeout_id);
+    self->priv->resize_timeout_id = 0;
+  }
 
   if (self->priv->freerdp_session != NULL) {
     freerdp_disconnect (self->priv->freerdp_session);
+    /* freerdp_free() only frees the instance struct (verified in FreeRDP
+     * 3.32.1 libfreerdp/core/freerdp.c); upstream never freed the context,
+     * leaking settings, channels and the GDI framebuffer per session. */
+    if (self->priv->freerdp_session->context != NULL)
+      freerdp_context_free (self->priv->freerdp_session);
     g_clear_pointer (&self->priv->freerdp_session, freerdp_free);
   }
+
+  g_clear_object (&self->priv->frame);
+  self->priv->frame_dirty = FALSE;
+  self->priv->cursor = NULL;
+
+  if (self->priv->display != NULL)
+    gtk_widget_queue_draw (self->priv->display);
+
+  /* Idempotent: dispose, an explicit close and a server disconnect can all
+   * land here; only the first one is a state change worth announcing. */
+  if (!was_open)
+    return FALSE;
 
   g_signal_emit (self, signals[RDP_DISCONNECTED], 0);
   g_debug ("RDP client disconnected");
@@ -906,63 +847,172 @@ idle_close (gpointer user_data)
   return FALSE;
 }
 
-static gboolean
-update (gpointer user_data)
+/*
+ * FreeRDP event source.
+ *
+ * Upstream ran an idle callback that blocked the GTK thread in
+ * WaitForMultipleObjects() for up to 20 ms per iteration: ~50 wake-ups/s
+ * and ~7% of a core while the remote desktop was completely idle, plus up
+ * to 20 ms of input latency. This GSource instead hands FreeRDP's handles
+ * to the GLib main loop, which sleeps until one is ready:
+ *  - Unix/macOS: winpr_Handle_getFd() gives a pollable fd for each handle
+ *  - Windows: g_poll() waits on HANDLEs directly (GPollFD.fd is a HANDLE)
+ * Handles that have no fd fall back to a short poll timeout.
+ */
+#define FRDP_MAX_HANDLES 64
+#define FRDP_FALLBACK_POLL_MS 20
+
+typedef struct
 {
-  DWORD status;
-  HANDLE handles[64];
-  DWORD usedHandles;
-  FrdpSessionPrivate *priv;
-  FrdpSession *self = (FrdpSession*) user_data;
-  GdkRectangle *rectangle;
+  GSource      source;
+  FrdpSession *self;
+  GPollFD      fds[FRDP_MAX_HANDLES];
+  guint        n_fds;
+  gboolean     needs_fallback_poll;
+} FrdpEventSource;
 
-  priv = self->priv;
+/* Re-registers poll fds only when FreeRDP's handle set actually changed.
+ * Changing a source's polls makes GLib discard the current iteration and
+ * start over without sleeping, so touching them on every prepare() spins
+ * a full core (measured). */
+static void
+frdp_event_source_refresh (FrdpEventSource *src)
+{
+  FrdpSessionPrivate *priv = src->self->priv;
+  HANDLE              handles[FRDP_MAX_HANDLES];
+  gintptr             fds[FRDP_MAX_HANDLES];
+  guint               n_new = 0;
+  gboolean            fallback = FALSE;
+  DWORD               n = 0, i;
 
-  if (priv->display != NULL && !gtk_widget_get_mapped (priv->display))
-    return TRUE;
+  if (priv->freerdp_session != NULL)
+    n = freerdp_get_event_handles (priv->freerdp_session->context, handles, ARRAYSIZE (handles));
+  if (n == 0)
+    fallback = TRUE;
 
-  g_mutex_lock (&priv->area_draw_mutex);
-
-  while (priv->area_draw_queue != NULL && !g_queue_is_empty (priv->area_draw_queue)) {
-      rectangle = g_queue_pop_head (priv->area_draw_queue);
-      gtk_widget_queue_draw_area (priv->display, rectangle->x, rectangle->y, rectangle->width, rectangle->height);
-      g_free (rectangle);
+  for (i = 0; i < n; i++) {
+#ifdef G_OS_WIN32
+    gintptr fd = (gintptr) handles[i];
+#else
+    gintptr fd = GetEventFileDescriptor (handles[i]);
+#endif
+    if (fd < 0)
+      fallback = TRUE;
+    else
+      fds[n_new++] = fd;
   }
 
-  g_mutex_unlock (&priv->area_draw_mutex);
+  src->needs_fallback_poll = fallback;
+
+  if (n_new == src->n_fds) {
+    gboolean same = TRUE;
+
+    for (i = 0; i < n_new && same; i++)
+      same = (src->fds[i].fd == fds[i]);
+    if (same)
+      return;
+  }
+
+  for (i = 0; i < src->n_fds; i++)
+    g_source_remove_poll (&src->source, &src->fds[i]);
+
+  for (i = 0; i < n_new; i++) {
+    src->fds[i].fd = fds[i];
+    src->fds[i].events = G_IO_IN | G_IO_HUP | G_IO_ERR;
+    src->fds[i].revents = 0;
+    g_source_add_poll (&src->source, &src->fds[i]);
+  }
+  src->n_fds = n_new;
+}
+
+static gboolean
+frdp_event_source_prepare (GSource *source, gint *timeout)
+{
+  FrdpEventSource *src = (FrdpEventSource *) source;
+
+  /* The handle set changes as channels come and go; re-read it each cycle.
+   * It is a handful of handles, so this is cheap. */
+  frdp_event_source_refresh (src);
+  *timeout = src->needs_fallback_poll ? FRDP_FALLBACK_POLL_MS : -1;
+
+  /* Never "ready" just because a frame is dirty: frames only become dirty
+   * inside dispatch (FreeRDP paints during freerdp_check_event_handles),
+   * which queues the draw itself, and GTK snapshots on map anyway.
+   * Reporting dirty here would spin until the next frame clock tick. */
+  return FALSE;
+}
+
+static gboolean
+frdp_event_source_check (GSource *source)
+{
+  FrdpEventSource *src = (FrdpEventSource *) source;
+  guint            i;
+
+  if (src->needs_fallback_poll)
+    return TRUE;
+
+  for (i = 0; i < src->n_fds; i++)
+    if (src->fds[i].revents != 0)
+      return TRUE;
+
+  return FALSE;
+}
+
+static gboolean
+frdp_event_source_dispatch (GSource *source, GSourceFunc callback, gpointer user_data)
+{
+  FrdpEventSource    *src = (FrdpEventSource *) source;
+  FrdpSession        *self = src->self;
+  FrdpSessionPrivate *priv = self->priv;
+
+  spike_stats.loops++;
+  spike_stats_tick ();
+
+  if (priv->freerdp_session == NULL)
+    return G_SOURCE_REMOVE;
+
+  if (!freerdp_check_event_handles (priv->freerdp_session->context) &&
+      freerdp_get_last_error (priv->freerdp_session->context) == FREERDP_ERROR_SUCCESS)
+    g_warning ("Failed to check FreeRDP event handles");
 
   if (freerdp_shall_disconnect_context (priv->freerdp_session->context)) {
-      priv->update_id = 0;
-      g_idle_add ((GSourceFunc) idle_close, self);
-
-      return FALSE;
-  }
-
-  usedHandles = freerdp_get_event_handles (priv->freerdp_session->context,
-                                           handles, ARRAYSIZE(handles));
-  if (usedHandles == 0) {
-      g_warning ("Failed to get FreeRDP event handle");
-      priv->update_id = 0;
-      return FALSE;
-  }
-
-  status = WaitForMultipleObjects (usedHandles, handles, FALSE, SELECT_TIMEOUT);
-  if (status == WAIT_TIMEOUT)
-    return TRUE;
-  if (status == WAIT_FAILED) {
     priv->update_id = 0;
-    return FALSE;
+    g_idle_add ((GSourceFunc) idle_close, self);
+    return G_SOURCE_REMOVE;
   }
 
-  if (!freerdp_check_event_handles (priv->freerdp_session->context)) {
-    if (freerdp_get_last_error(priv->freerdp_session->context) == FREERDP_ERROR_SUCCESS) {
-      g_warning ("Failed to check FreeRDP file descriptor");
-    }
-
-    return TRUE;
+  /* Upstream skipped all processing while the widget was unmapped, which
+   * would stall the connection of a hidden (background) tab. Only drawing
+   * is skipped now; the frame stays dirty until the widget is shown. */
+  if (priv->frame_dirty && priv->display != NULL && gtk_widget_get_mapped (priv->display)) {
+    spike_stats.signaled++;
+    gtk_widget_queue_draw (priv->display);
   }
 
-  return TRUE;
+  return G_SOURCE_CONTINUE;
+}
+
+static GSourceFuncs frdp_event_source_funcs = {
+  frdp_event_source_prepare,
+  frdp_event_source_check,
+  frdp_event_source_dispatch,
+  NULL, NULL, NULL
+};
+
+static guint
+frdp_session_attach_event_source (FrdpSession *self)
+{
+  GSource         *source = g_source_new (&frdp_event_source_funcs, sizeof (FrdpEventSource));
+  FrdpEventSource *src = (FrdpEventSource *) source;
+  guint            id;
+
+  src->self = self;
+  src->n_fds = 0;
+  g_source_set_name (source, "FreeRDP events");
+  id = g_source_attach (source, NULL);
+  g_source_unref (source);
+
+  return id;
 }
 
 /*
@@ -1322,16 +1372,13 @@ frdp_session_connect_thread (GTask        *task,
     return;
   }
 
-  gtk_widget_realize (self->priv->display);
-  create_cairo_surface (self);
-  g_signal_connect (self->priv->display, "draw",
-                    G_CALLBACK (frdp_session_draw), self);
-  g_signal_connect (self->priv->display, "configure-event",
-                    G_CALLBACK (frdp_session_configure_event), self);
+  frdp_session_update_size_request (self);
+  frdp_session_update_scale (self);
+  self->priv->frame_dirty = TRUE;
   g_signal_connect (self->priv->display, "notify::resize-supported",
                     G_CALLBACK (frdp_session_resize_supported_changed), self);
 
-  self->priv->update_id = g_idle_add ((GSourceFunc) update, self);
+  self->priv->update_id = frdp_session_attach_event_source (self);
 
   g_task_return_boolean (task, TRUE);
 }
@@ -1427,6 +1474,13 @@ frdp_session_finalize (GObject *object)
   FrdpSession *self = (FrdpSession*) object;
 
   idle_close (self);
+
+  g_free (self->priv->hostname);
+  g_free (self->priv->username);
+  if (self->priv->password != NULL)
+    memset (self->priv->password, 0, strlen (self->priv->password));
+  g_free (self->priv->password);
+  g_free (self->priv->domain);
 
   G_OBJECT_CLASS (frdp_session_parent_class)->finalize (object);
 }
@@ -1536,17 +1590,13 @@ frdp_session_init (FrdpSession *self)
 {
   self->priv = frdp_session_get_instance_private (self);
 
-  g_mutex_init (&self->priv->area_draw_mutex);
-  self->priv->area_draw_queue = g_queue_new ();
-
   self->priv->is_connected = FALSE;
+  self->priv->scale = 1.0;
 }
 
 FrdpSession*
 frdp_session_new (FrdpDisplay *display)
 {
-  gtk_widget_show (GTK_WIDGET (display));
-
   return g_object_new (FRDP_TYPE_SESSION,
                        "display", display,
                        NULL);
@@ -1562,6 +1612,7 @@ frdp_session_connect (FrdpSession         *self,
 {
   GTask *task;
 
+  g_free (self->priv->hostname);
   self->priv->hostname = g_strdup (hostname);
   self->priv->port = port;
 
@@ -1729,51 +1780,34 @@ frdp_session_mouse_pointer  (FrdpSession          *self,
   frdp_session_update_mouse_pointer (self);
 }
 
+/* GTK4 hands over the platform's hardware keycode. Its meaning differs per
+ * GDK backend, so the translation to an RDP scancode is per platform:
+ *  - Linux (X11 and Wayland): XKB keycodes
+ *  - macOS: Apple virtual keycodes
+ *  - Windows: GDK reports the Win32 virtual-key code
+ * Only the Linux path has been exercised by the spike. */
 void
 frdp_session_send_key (FrdpSession  *self,
-                       GdkEventKey  *key)
+                       guint         keycode,
+                       gboolean      pressed)
 {
-  rdpInput *input = self->priv->freerdp_session->context->input;
-
-#ifdef HAVE_FREERDP_3_11_0
+  rdpInput *input;
   guint32   virtual_code, virtual_scan_code;
 
-  virtual_code = GetVirtualKeyCodeFromKeycode (key->hardware_keycode, WINPR_KEYCODE_TYPE_XKB);
+  g_return_if_fail (self->priv->freerdp_session != NULL);
+  input = self->priv->freerdp_session->context->input;
+
+#if defined(G_OS_WIN32)
+  virtual_code = keycode;
+#elif defined(__APPLE__)
+  virtual_code = GetVirtualKeyCodeFromKeycode (keycode, WINPR_KEYCODE_TYPE_APPLE);
+#else
+  virtual_code = GetVirtualKeyCodeFromKeycode (keycode, WINPR_KEYCODE_TYPE_XKB);
+#endif
   virtual_scan_code = GetVirtualScanCodeFromVirtualKeyCode (virtual_code, WINPR_KBD_TYPE_IBM_ENHANCED);
 
   if (virtual_scan_code != RDP_SCANCODE_UNKNOWN &&
       (frdp_display_is_keyboard_grabbed (FRDP_DISPLAY (self->priv->display)) ||
        (virtual_scan_code != RDP_SCANCODE_LWIN && virtual_scan_code != RDP_SCANCODE_RWIN)))
-    freerdp_input_send_keyboard_event_ex (input, key->type == GDK_KEY_PRESS, FALSE, virtual_scan_code);
-#else
-  DWORD scancode = 0;
-  guint8 keycode;
-  guint16 flags;
-  gboolean extended = FALSE;
-
-  scancode =
-    freerdp_keyboard_get_rdp_scancode_from_x11_keycode (key->hardware_keycode);
-
-  keycode = scancode & 0xFF;
-  extended = scancode & 0x100;
-
-  flags = extended ? KBD_FLAGS_EXTENDED : 0;
-  flags |= key->type == GDK_KEY_PRESS ? KBD_FLAGS_DOWN : KBD_FLAGS_RELEASE;
-
-  if (keycode)
-    input->KeyboardEvent (input, flags, keycode);
-#endif
-}
-
-GdkPixbuf *
-frdp_session_get_pixbuf (FrdpSession *self)
-{
-  guint width, height;
-
-  width = gtk_widget_get_allocated_width (self->priv->display);
-  height = gtk_widget_get_allocated_height (self->priv->display);
-
-  return gdk_pixbuf_get_from_surface (self->priv->surface,
-                                      0, 0,
-                                      width, height);
+    freerdp_input_send_keyboard_event_ex (input, pressed, FALSE, virtual_scan_code);
 }

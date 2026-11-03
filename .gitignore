@@ -1,0 +1,4 @@
+inst/
+spike/*.log
+spike/*.png
+spike/*.pid

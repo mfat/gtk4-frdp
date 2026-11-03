@@ -2,6 +2,14 @@
  *
  * Copyright (C) 2018 Felipe Borges <felipeborges@gnome.org>
  *
+ * GTK4 port for the sshPilot embedded-RDP spike (2026):
+ *  - GtkDrawingArea + GTK3 event vfuncs -> GtkWidget + event controllers
+ *  - "draw"/"configure-event" -> snapshot() / size_allocate() forwarded to
+ *    the session
+ *  - gdk_seat_grab() keyboard grab -> gdk_toplevel_inhibit_system_shortcuts()
+ *  - fixed: open_host() leaked a widget reference; the session was never
+ *    released; certificate prompts answered synchronously hung forever
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -37,9 +45,12 @@ struct _FrdpDisplayPrivate
   guint        certificate_change_verification_value;
 
   gboolean     keyboard_grabbed;
+
+  double       last_x;
+  double       last_y;
 };
 
-G_DEFINE_TYPE_WITH_PRIVATE (FrdpDisplay, frdp_display, GTK_TYPE_DRAWING_AREA)
+G_DEFINE_TYPE_WITH_PRIVATE (FrdpDisplay, frdp_display, GTK_TYPE_WIDGET)
 
 enum
 {
@@ -79,155 +90,209 @@ frdp_display_is_initialized (FrdpDisplay *self)
   return priv->session != NULL && frdp_display_is_open (self);
 }
 
+/* ---- input ------------------------------------------------------------ */
+
 static gboolean
-frdp_display_key_press_event (GtkWidget   *widget,
-                              GdkEventKey *key)
+frdp_display_key_pressed (GtkEventControllerKey *controller,
+                          guint                  keyval,
+                          guint                  keycode,
+                          GdkModifierType        state,
+                          gpointer               user_data)
 {
-  FrdpDisplay *self = FRDP_DISPLAY (widget);
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
 
   if (!frdp_display_is_initialized (self))
     return TRUE;
 
-  frdp_session_send_key (priv->session, key);
+  frdp_session_send_key (priv->session, keycode, TRUE);
 
   return TRUE;
 }
 
-static gboolean
-frdp_display_motion_notify_event (GtkWidget      *widget,
-                                  GdkEventMotion *event)
+static void
+frdp_display_key_released (GtkEventControllerKey *controller,
+                           guint                  keyval,
+                           guint                  keycode,
+                           GdkModifierType        state,
+                           gpointer               user_data)
 {
-  FrdpDisplay *self = FRDP_DISPLAY (widget);
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
 
   if (!frdp_display_is_initialized (self))
-    return TRUE;
+    return;
 
-  frdp_session_mouse_event (priv->session,
-                            FRDP_MOUSE_EVENT_MOVE,
-                            event->x,
-                            event->y);
-
-  return TRUE;
+  frdp_session_send_key (priv->session, keycode, FALSE);
 }
 
-static gboolean
-frdp_display_button_press_event (GtkWidget      *widget,
-                                 GdkEventButton *event)
+static void
+frdp_display_motion (GtkEventControllerMotion *controller,
+                     double                    x,
+                     double                    y,
+                     gpointer                  user_data)
 {
-  FrdpDisplay *self = FRDP_DISPLAY (widget);
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
-  guint16 flags = 0;
+
+  priv->last_x = x;
+  priv->last_y = y;
 
   if (!frdp_display_is_initialized (self))
-    return TRUE;
+    return;
 
-  if ((event->button < 1) || (event->button > 3))
-    return FALSE;
+  frdp_session_mouse_event (priv->session, FRDP_MOUSE_EVENT_MOVE, x, y);
+}
 
-  if ((event->type != GDK_BUTTON_PRESS) &&
-      (event->type != GDK_BUTTON_RELEASE))
-    return FALSE;
-
-  if (event->type == GDK_BUTTON_PRESS)
-    flags |= FRDP_MOUSE_EVENT_DOWN;
-  switch(event->button) {
+static guint16
+button_flags (guint button)
+{
+  switch (button) {
   case GDK_BUTTON_PRIMARY:
-    flags |= FRDP_MOUSE_EVENT_BUTTON1;
-    break;
+    return FRDP_MOUSE_EVENT_BUTTON1;
   case GDK_BUTTON_MIDDLE:
-    flags |= FRDP_MOUSE_EVENT_BUTTON3;
-    break;
+    return FRDP_MOUSE_EVENT_BUTTON3;
   case GDK_BUTTON_SECONDARY:
-    flags |= FRDP_MOUSE_EVENT_BUTTON2;
-    break;
+    return FRDP_MOUSE_EVENT_BUTTON2;
   case 8:
-    flags |= FRDP_MOUSE_EVENT_BUTTON4;
-    break;
+    return FRDP_MOUSE_EVENT_BUTTON4;
   case 9:
-    flags |= FRDP_MOUSE_EVENT_BUTTON5;
-    break;
+    return FRDP_MOUSE_EVENT_BUTTON5;
   default:
-    return FALSE;
+    return 0;
   }
+}
 
-  frdp_session_mouse_event (priv->session,
-                            flags,
-                            event->x,
-                            event->y);
+static void
+frdp_display_button (GtkGestureClick *gesture,
+                     double           x,
+                     double           y,
+                     gboolean         pressed,
+                     gpointer         user_data)
+{
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
+  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+  guint16 flags;
 
-  return TRUE;
+  if (pressed)
+    gtk_widget_grab_focus (GTK_WIDGET (self));
+
+  if (!frdp_display_is_initialized (self))
+    return;
+
+  flags = button_flags (gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture)));
+  if (flags == 0)
+    return;
+
+  if (pressed)
+    flags |= FRDP_MOUSE_EVENT_DOWN;
+
+  priv->last_x = x;
+  priv->last_y = y;
+  frdp_session_mouse_event (priv->session, flags, x, y);
+}
+
+static void
+frdp_display_pressed (GtkGestureClick *gesture,
+                      gint             n_press,
+                      double           x,
+                      double           y,
+                      gpointer         user_data)
+{
+  frdp_display_button (gesture, x, y, TRUE, user_data);
+}
+
+static void
+frdp_display_released (GtkGestureClick *gesture,
+                       gint             n_press,
+                       double           x,
+                       double           y,
+                       gpointer         user_data)
+{
+  frdp_display_button (gesture, x, y, FALSE, user_data);
 }
 
 static gboolean
-frdp_display_scroll_event (GtkWidget      *widget,
-                           GdkEventScroll *event)
+frdp_display_scroll (GtkEventControllerScroll *controller,
+                     double                    dx,
+                     double                    dy,
+                     gpointer                  user_data)
 {
-  FrdpDisplay *self = FRDP_DISPLAY (widget);
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
-  guint16 flags = FRDP_MOUSE_EVENT_WHEEL;
 
   if (!frdp_display_is_initialized (self))
     return TRUE;
 
-  switch (event->direction) {
-    case GDK_SCROLL_UP:
-      flags = FRDP_MOUSE_EVENT_WHEEL;
-      break;
-    case GDK_SCROLL_DOWN:
-      flags = FRDP_MOUSE_EVENT_WHEEL | FRDP_MOUSE_EVENT_WHEEL_NEGATIVE;
-      break;
-    case GDK_SCROLL_LEFT:
-      flags = FRDP_MOUSE_EVENT_HWHEEL | FRDP_MOUSE_EVENT_WHEEL_NEGATIVE;
-      break;
-    case GDK_SCROLL_RIGHT:
-      flags = FRDP_MOUSE_EVENT_HWHEEL;
-      break;
-    case GDK_SCROLL_SMOOTH:
-      frdp_session_mouse_smooth_scroll_event (priv->session,
-                                              event->x,
-                                              event->y,
-                                              event->delta_x,
-                                              event->delta_y);
-      return TRUE;
-    default:
-      return FALSE;
-  }
-
-  frdp_session_mouse_event (priv->session,
-                            flags,
-                            event->x,
-                            event->y);
-
+  /* GTK4 reports wheel clicks as +-1.0 deltas and touchpads as smooth
+   * deltas; the session's smooth path handles both (1.0 == one notch). */
+  frdp_session_mouse_smooth_scroll_event (priv->session,
+                                          priv->last_x, priv->last_y,
+                                          dx, dy);
   return TRUE;
 }
 
-static gboolean
-frdp_enter_notify_event (GtkWidget        *widget,
-                         GdkEventCrossing *event)
+static void
+frdp_display_enter (GtkEventControllerMotion *controller,
+                    double                    x,
+                    double                    y,
+                    gpointer                  user_data)
 {
-  FrdpDisplay *self = FRDP_DISPLAY (widget);
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+
+  if (priv->session == NULL)
+    return;
 
   frdp_session_mouse_pointer (priv->session, TRUE);
   frdp_display_keyboard_grab (self);
-
-  return TRUE;
 }
 
-static gboolean
-frdp_leave_notify_event (GtkWidget         *widget,
-                         GdkEventCrossing  *event)
+static void
+frdp_display_leave (GtkEventControllerMotion *controller,
+                    gpointer                  user_data)
+{
+  FrdpDisplay *self = FRDP_DISPLAY (user_data);
+  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+
+  if (priv->session == NULL)
+    return;
+
+  frdp_session_mouse_pointer (priv->session, FALSE);
+  frdp_display_keyboard_ungrab (self);
+}
+
+/* ---- rendering / allocation -------------------------------------------- */
+
+static void
+frdp_display_snapshot (GtkWidget   *widget,
+                       GtkSnapshot *snapshot)
 {
   FrdpDisplay *self = FRDP_DISPLAY (widget);
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
 
-  frdp_session_mouse_pointer (priv->session, FALSE);
-  frdp_display_keyboard_ungrab (self);
-
-  return TRUE;
+  if (priv->session != NULL)
+    frdp_session_snapshot (priv->session, snapshot,
+                           gtk_widget_get_width (widget),
+                           gtk_widget_get_height (widget));
 }
+
+static void
+frdp_display_size_allocate (GtkWidget *widget,
+                            int        width,
+                            int        height,
+                            int        baseline)
+{
+  FrdpDisplay *self = FRDP_DISPLAY (widget);
+  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+
+  GTK_WIDGET_CLASS (frdp_display_parent_class)->size_allocate (widget, width, height, baseline);
+
+  if (priv->session != NULL)
+    frdp_session_size_allocated (priv->session, width, height);
+}
+
+/* ---- session signals ---------------------------------------------------- */
 
 static void
 frdp_display_error (GObject     *source_object,
@@ -284,7 +349,13 @@ frdp_display_open_host_cb (GObject      *source_object,
 
     g_debug ("Connection failed");
   }
+
+  g_clear_error (&error);
+  /* Balances the reference taken in frdp_display_open_host() (upstream leaked it). */
+  g_object_unref (self);
 }
+
+/* ---- GObject ------------------------------------------------------------ */
 
 static void
 frdp_display_get_property (GObject      *object,
@@ -301,15 +372,15 @@ frdp_display_get_property (GObject      *object,
     {
       case PROP_USERNAME:
         g_object_get (session, "username", &str_property, NULL);
-        g_value_set_string (value, str_property);
+        g_value_take_string (value, str_property);
         break;
       case PROP_PASSWORD:
         g_object_get (session, "password", &str_property, NULL);
-        g_value_set_string (value, str_property);
+        g_value_take_string (value, str_property);
         break;
       case PROP_DOMAIN:
         g_object_get (session, "domain", &str_property, NULL);
-        g_value_set_string (value, str_property);
+        g_value_take_string (value, str_property);
         break;
       case PROP_SCALING:
         g_object_get (session, "scaling", &str_property, NULL);
@@ -365,6 +436,28 @@ frdp_display_set_property (GObject      *object,
 }
 
 static void
+frdp_display_dispose (GObject *object)
+{
+  FrdpDisplay *self = FRDP_DISPLAY (object);
+  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+
+  /* Upstream never released the session, so every widget leaked its
+   * FreeRDP context and framebuffer. */
+  if (priv->session != NULL) {
+    g_signal_handlers_disconnect_by_data (priv->session, self);
+    frdp_session_close (priv->session);
+    g_clear_object (&priv->session);
+  }
+
+  /* Unblock any nested prompt loop still waiting on this widget. */
+  priv->awaiting_authentication = FALSE;
+  priv->awaiting_certificate_verification = FALSE;
+  priv->awaiting_certificate_change_verification = FALSE;
+
+  G_OBJECT_CLASS (frdp_display_parent_class)->dispose (object);
+}
+
+static void
 frdp_display_class_init (FrdpDisplayClass *klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
@@ -372,15 +465,10 @@ frdp_display_class_init (FrdpDisplayClass *klass)
 
   gobject_class->get_property = frdp_display_get_property;
   gobject_class->set_property = frdp_display_set_property;
+  gobject_class->dispose = frdp_display_dispose;
 
-  widget_class->key_press_event = frdp_display_key_press_event;
-  widget_class->key_release_event = frdp_display_key_press_event;
-  widget_class->motion_notify_event = frdp_display_motion_notify_event;
-  widget_class->button_press_event = frdp_display_button_press_event;
-  widget_class->button_release_event = frdp_display_button_press_event;
-  widget_class->scroll_event = frdp_display_scroll_event;
-  widget_class->enter_notify_event = frdp_enter_notify_event;
-  widget_class->leave_notify_event = frdp_leave_notify_event;
+  widget_class->snapshot = frdp_display_snapshot;
+  widget_class->size_allocate = frdp_display_size_allocate;
 
   g_object_class_install_property (gobject_class,
                                    PROP_USERNAME,
@@ -496,18 +584,33 @@ static void
 frdp_display_init (FrdpDisplay *self)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (self);
+  GtkEventController *key, *motion, *scroll;
+  GtkGesture *click;
 
-  gtk_widget_add_events (GTK_WIDGET (self),
-                         GDK_POINTER_MOTION_MASK |
-                         GDK_BUTTON_PRESS_MASK |
-                         GDK_BUTTON_RELEASE_MASK |
-                         GDK_SCROLL_MASK |
-                         GDK_SMOOTH_SCROLL_MASK |
-                         GDK_KEY_PRESS_MASK |
-                         GDK_ENTER_NOTIFY_MASK |
-                         GDK_LEAVE_NOTIFY_MASK);
+  gtk_widget_set_focusable (GTK_WIDGET (self), TRUE);
+  gtk_widget_set_hexpand (GTK_WIDGET (self), TRUE);
+  gtk_widget_set_vexpand (GTK_WIDGET (self), TRUE);
 
-  gtk_widget_set_can_focus (GTK_WIDGET (self), TRUE);
+  key = gtk_event_controller_key_new ();
+  g_signal_connect (key, "key-pressed", G_CALLBACK (frdp_display_key_pressed), self);
+  g_signal_connect (key, "key-released", G_CALLBACK (frdp_display_key_released), self);
+  gtk_widget_add_controller (GTK_WIDGET (self), key);
+
+  motion = gtk_event_controller_motion_new ();
+  g_signal_connect (motion, "motion", G_CALLBACK (frdp_display_motion), self);
+  g_signal_connect (motion, "enter", G_CALLBACK (frdp_display_enter), self);
+  g_signal_connect (motion, "leave", G_CALLBACK (frdp_display_leave), self);
+  gtk_widget_add_controller (GTK_WIDGET (self), motion);
+
+  click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0); /* all buttons */
+  g_signal_connect (click, "pressed", G_CALLBACK (frdp_display_pressed), self);
+  g_signal_connect (click, "released", G_CALLBACK (frdp_display_released), self);
+  gtk_widget_add_controller (GTK_WIDGET (self), GTK_EVENT_CONTROLLER (click));
+
+  scroll = gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+  g_signal_connect (scroll, "scroll", G_CALLBACK (frdp_display_scroll), self);
+  gtk_widget_add_controller (GTK_WIDGET (self), scroll);
 
   priv->session = frdp_session_new (self);
 
@@ -565,7 +668,7 @@ frdp_display_is_open (FrdpDisplay *display)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
 
-  return frdp_session_is_open (priv->session);
+  return priv->session != NULL && frdp_session_is_open (priv->session);
 }
 
 /**
@@ -579,7 +682,8 @@ frdp_display_close (FrdpDisplay *display)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
 
-  frdp_session_close (priv->session);
+  if (priv->session != NULL)
+    frdp_session_close (priv->session);
 }
 
 /**
@@ -609,9 +713,8 @@ frdp_display_set_scaling (FrdpDisplay *display,
       gtk_widget_set_valign (GTK_WIDGET (display), GTK_ALIGN_FILL);
     }
 
-    gtk_widget_queue_draw_area (GTK_WIDGET (display), 0, 0,
-                                gtk_widget_get_allocated_width (GTK_WIDGET (display)),
-                                gtk_widget_get_allocated_height (GTK_WIDGET (display)));
+    gtk_widget_queue_resize (GTK_WIDGET (display));
+    gtk_widget_queue_draw (GTK_WIDGET (display));
   }
 }
 
@@ -630,9 +733,7 @@ frdp_display_set_allow_resize (FrdpDisplay *display,
     gtk_widget_set_valign (GTK_WIDGET (display), GTK_ALIGN_FILL);
   }
 
-  gtk_widget_queue_draw_area (GTK_WIDGET (display), 0, 0,
-                              gtk_widget_get_allocated_width (GTK_WIDGET (display)),
-                              gtk_widget_get_allocated_height (GTK_WIDGET (display)));
+  gtk_widget_queue_draw (GTK_WIDGET (display));
 }
 
 /*
@@ -721,10 +822,15 @@ frdp_display_certificate_verify_ex (FrdpDisplay *display,
                                     const gchar *subject,
                                     const gchar *issuer,
                                     const gchar *fingerprint,
-                                    DWORD        flags)
+                                    guint32      flags)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
   GMainContext       *context;
+
+  /* Set before emitting: upstream set it after, so a handler that
+   * answered synchronously had its answer overwritten and hung forever. */
+  priv->awaiting_certificate_verification = TRUE;
+  priv->certificate_verification_value = 0;
 
   g_signal_emit (display,
                  signals[RDP_NEEDS_CERTIFICATE_VERIFICATION],
@@ -736,8 +842,6 @@ frdp_display_certificate_verify_ex (FrdpDisplay *display,
                  issuer,
                  fingerprint,
                  flags);
-
-  priv->awaiting_certificate_verification = TRUE;
 
   context = g_main_context_default ();
 
@@ -758,10 +862,13 @@ frdp_display_certificate_change_verify_ex (FrdpDisplay *display,
                                            const gchar *old_subject,
                                            const gchar *old_issuer,
                                            const gchar *old_fingerprint,
-                                           DWORD        flags)
+                                           guint32      flags)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
   GMainContext       *context;
+
+  priv->awaiting_certificate_change_verification = TRUE;
+  priv->certificate_change_verification_value = 0;
 
   g_signal_emit (display, signals[RDP_NEEDS_CERTIFICATE_CHANGE_VERIFICATION], 0,
                  host,
@@ -775,8 +882,6 @@ frdp_display_certificate_change_verify_ex (FrdpDisplay *display,
                  old_fingerprint,
                  flags);
 
-  priv->awaiting_certificate_change_verification = TRUE;
-
   context = g_main_context_default ();
 
   while (priv->awaiting_certificate_change_verification)
@@ -786,7 +891,7 @@ frdp_display_certificate_change_verify_ex (FrdpDisplay *display,
 }
 
 /**
- * frdp_display_certificate_verify:
+ * frdp_display_certificate_verify_ex_finish:
  * @display: (transfer none): the RDP display widget
  * @verification: verification value (1 - accept and store the certificate,
  *                                    2 - accept the certificate for this session only
@@ -811,7 +916,7 @@ frdp_display_certificate_verify_ex_finish (FrdpDisplay *display,
 }
 
 /**
- * frdp_display_certificate_change_verify:
+ * frdp_display_certificate_change_verify_ex_finish:
  * @display: (transfer none): the RDP display widget
  * @verification: verification value (1 - accept and store the certificate,
  *                                    2 - accept the certificate for this session only
@@ -835,54 +940,45 @@ frdp_display_certificate_change_verify_ex_finish (FrdpDisplay *display,
   priv->awaiting_certificate_change_verification = FALSE;
 }
 
-/**
- * frdp_display_get_pixbuf:
- * @display: (transfer none): the RDP display widget
- *
- * Take a screenshot of the display.
- *
- * Returns: (transfer full): a #GdkPixbuf with the screenshot image buffer
- */
-GdkPixbuf *
-frdp_display_get_pixbuf (FrdpDisplay *display)
+static GdkToplevel *
+frdp_display_get_toplevel (FrdpDisplay *display)
 {
-  FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
+  GtkNative  *native = gtk_widget_get_native (GTK_WIDGET (display));
+  GdkSurface *surface;
 
-  return frdp_session_get_pixbuf (priv->session);
+  if (native == NULL)
+    return NULL;
+
+  surface = gtk_native_get_surface (native);
+
+  return GDK_IS_TOPLEVEL (surface) ? GDK_TOPLEVEL (surface) : NULL;
 }
 
+/* GTK4 has no keyboard grab. Inhibiting the compositor's system shortcuts
+ * while the pointer is over the desktop is the supported equivalent (Super,
+ * Alt+Tab etc. then reach the remote session). */
 static void
 frdp_display_keyboard_grab (FrdpDisplay *display)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
-  GdkGrabStatus       status;
+  GdkToplevel        *toplevel = frdp_display_get_toplevel (display);
 
-  if (gtk_widget_get_realized (GTK_WIDGET (display))) {
-    status = gdk_seat_grab (gdk_display_get_default_seat (gtk_widget_get_display (GTK_WIDGET (display))),
-                            gtk_widget_get_window (GTK_WIDGET (display)),
-                            GDK_SEAT_CAPABILITY_KEYBOARD,
-                            TRUE,
-                            NULL,
-                            NULL,
-                            NULL,
-                            NULL);
+  if (toplevel == NULL)
+    return;
 
-    if (status == GDK_GRAB_SUCCESS) {
-      priv->keyboard_grabbed = TRUE;
-    } else {
-      g_warning ("keyboard grab failed %d", status);
-
-      priv->keyboard_grabbed = FALSE;
-    }
-  }
+  gdk_toplevel_inhibit_system_shortcuts (toplevel, NULL);
+  priv->keyboard_grabbed = TRUE;
 }
 
 static void
 frdp_display_keyboard_ungrab (FrdpDisplay *display)
 {
   FrdpDisplayPrivate *priv = frdp_display_get_instance_private (display);
+  GdkToplevel        *toplevel = frdp_display_get_toplevel (display);
 
-  gdk_seat_ungrab (gdk_display_get_default_seat (gtk_widget_get_display (GTK_WIDGET (display))));
+  if (toplevel != NULL && priv->keyboard_grabbed)
+    gdk_toplevel_restore_system_shortcuts (toplevel);
+
   priv->keyboard_grabbed = FALSE;
 }
 
