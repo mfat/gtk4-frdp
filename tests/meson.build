@@ -29,5 +29,14 @@ if get_option('introspection') and python.found()
     depends: gtk4_frdp_gir,
     timeout: 120,
     suite: 'live',
+    is_parallel: false,  # one server account: concurrent logins evict each other
+  )
+  test('live-cursor', python,
+    args: [ files('live-cursor.py') ],
+    env: test_env,
+    depends: gtk4_frdp_gir,
+    timeout: 60,
+    suite: 'live',
+    is_parallel: false,  # one server account: concurrent logins evict each other
   )
 endif

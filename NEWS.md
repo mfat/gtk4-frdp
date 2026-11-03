@@ -23,5 +23,6 @@ First release as a standalone GTK 4 library, derived from gtk-frdp
   never freed; use-after-free after a failed connection; a certificate
   prompt answered from its signal handler hung; a hidden widget stopped
   processing network events.
+- The remote cursor is scaled together with the desktop.
 - New: test suite (no server needed, plus an optional live suite), API
   reference (gi-docgen), C and Python example viewers.

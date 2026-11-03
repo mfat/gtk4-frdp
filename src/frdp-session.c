@@ -134,7 +134,7 @@ struct _FrdpSessionPrivate
   int           alloc_width;
   int           alloc_height;
   guint         resize_timeout_id;
-  gboolean      show_cursor;
+  double        cursor_scale_applied; /* scale the current cursor was made for */
   gboolean      monitor_layout_supported;
   GdkTexture   *frame;
   gchar        *hostname;
@@ -280,6 +280,52 @@ frdp_session_schedule_cursor_update (FrdpSession *self)
 
 /* ---- pointer ------------------------------------------------------------ */
 
+/* Resizes a cursor image (CPU; cursors are tiny). GDK_MEMORY_DEFAULT is
+ * the format that matches cairo's ARGB32 on every platform. */
+static GdkTexture *
+frdp_scale_cursor_texture (GdkTexture *texture,
+                           double      scale)
+{
+  int                   w = gdk_texture_get_width (texture);
+  int                   h = gdk_texture_get_height (texture);
+  int                   sw = MAX (1, (int) ceil (w * scale));
+  int                   sh = MAX (1, (int) ceil (h * scale));
+  GdkTextureDownloader *downloader;
+  GBytes               *src_bytes, *dst_bytes;
+  gsize                 src_stride;
+  cairo_surface_t      *src, *dst;
+  cairo_t              *cr;
+  GdkTexture           *result;
+
+  downloader = gdk_texture_downloader_new (texture);
+  gdk_texture_downloader_set_format (downloader, GDK_MEMORY_DEFAULT);
+  src_bytes = gdk_texture_downloader_download_bytes (downloader, &src_stride);
+  gdk_texture_downloader_free (downloader);
+
+  src = cairo_image_surface_create_for_data ((guchar *) g_bytes_get_data (src_bytes, NULL),
+                                             CAIRO_FORMAT_ARGB32, w, h, src_stride);
+  dst = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, sw, sh);
+  cr = cairo_create (dst);
+  cairo_scale (cr, (double) sw / w, (double) sh / h);
+  cairo_set_source_surface (cr, src, 0, 0);
+  cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_GOOD);
+  cairo_paint (cr);
+  cairo_destroy (cr);
+  cairo_surface_flush (dst);
+
+  dst_bytes = g_bytes_new (cairo_image_surface_get_data (dst),
+                           (gsize) cairo_image_surface_get_stride (dst) * sh);
+  result = gdk_memory_texture_new (sw, sh, GDK_MEMORY_DEFAULT, dst_bytes,
+                                   cairo_image_surface_get_stride (dst));
+
+  g_bytes_unref (dst_bytes);
+  cairo_surface_destroy (dst);
+  cairo_surface_destroy (src);
+  g_bytes_unref (src_bytes);
+
+  return result;
+}
+
 static void
 frdp_session_update_mouse_pointer (FrdpSession  *self)
 {
@@ -300,16 +346,30 @@ frdp_session_update_mouse_pointer (FrdpSession  *self)
   hot_y = priv->cursor_y;
   g_mutex_unlock (&priv->state_lock);
 
-  if (priv->show_cursor && cursor_null) {
+  /* GTK 4 cursors are per widget and only shown while the pointer is over
+   * it, so no enter/leave bookkeeping is needed (GTK 3 gtk-frdp set the
+   * cursor on the whole window and had to swap it on enter/leave). */
+  if (cursor_null) {
     /* Server hides the pointer. */
     cursor = gdk_cursor_new_from_name ("none", NULL);
-  } else if (!priv->show_cursor || texture == NULL) {
+  } else if (texture == NULL) {
     cursor = gdk_cursor_new_from_name ("default", NULL);
   } else {
-    /* GTK4 scales cursor textures for the surface scale itself; the
-     * remote-desktop scale factor is not applied (known gap). */
+    double scale = priv->scaling ? priv->scale : 1.0;
+
+    if (fabs (scale - 1.0) > 0.01) {
+      /* Match the scaled desktop: a 32 px remote cursor over a desktop
+       * drawn at 50 % becomes 16 px, with its hotspot moved accordingly. */
+      GdkTexture *scaled = frdp_scale_cursor_texture (texture, scale);
+
+      hot_x = (gint) floor (hot_x * scale);
+      hot_y = (gint) floor (hot_y * scale);
+      g_set_object (&texture, scaled);
+      g_object_unref (scaled);
+    }
     cursor = gdk_cursor_new_from_texture (texture, hot_x, hot_y, NULL);
   }
+  priv->cursor_scale_applied = priv->scaling ? priv->scale : 1.0;
 
   gtk_widget_set_cursor (priv->display, cursor);
   g_clear_object (&cursor);
@@ -468,16 +528,21 @@ frdp_session_update_scale (FrdpSession *self)
   if (dw == 0 || dh == 0 || !priv->scaling || width <= 0 || height <= 0) {
     priv->scale = 1.0;
     priv->offset_x = priv->offset_y = 0.0;
-    return;
+  } else {
+    if (width / height > (double) dw / dh)
+      priv->scale = height / dh;
+    else
+      priv->scale = width / dw;
+
+    priv->offset_x = (width - dw * priv->scale) / 2.0;
+    priv->offset_y = (height - dh * priv->scale) / 2.0;
   }
 
-  if (width / height > (double) dw / dh)
-    priv->scale = height / dh;
-  else
-    priv->scale = width / dw;
-
-  priv->offset_x = (width - dw * priv->scale) / 2.0;
-  priv->offset_y = (height - dh * priv->scale) / 2.0;
+  /* The cursor is scaled with the desktop; rebuild it when the scale moved
+   * noticeably (not on every pixel of a window drag). */
+  if (priv->is_connected &&
+      fabs ((priv->scaling ? priv->scale : 1.0) - priv->cursor_scale_applied) > 0.02)
+    frdp_session_update_mouse_pointer (self);
 }
 
 static void
@@ -1836,6 +1901,7 @@ frdp_session_init (FrdpSession *self)
 
   self->priv->is_connected = FALSE;
   self->priv->scale = 1.0;
+  self->priv->cursor_scale_applied = 1.0;
 }
 
 FrdpSession*
@@ -2064,10 +2130,10 @@ void
 frdp_session_mouse_pointer  (FrdpSession          *self,
                              gboolean              enter)
 {
-  FrdpSessionPrivate *priv = self->priv;
-
-  priv->show_cursor = enter;
-  frdp_session_update_mouse_pointer (self);
+  /* Kept for the widget's enter/leave handlers; GTK 4 shows the widget
+   * cursor only while the pointer is over it, so nothing to switch. */
+  if (enter)
+    frdp_session_update_mouse_pointer (self);
 }
 
 void

@@ -101,6 +101,11 @@ glibc the library calls `malloc_trim(0)` after each session ends.
 - `live-session` (suite `live`) — skipped unless `GTK4_FRDP_TEST_HOST` is
   set; connects to a real server several times and fails on a missed
   connection, a widget that is not freed, or a UI stall over 250 ms.
+- `live-cursor` (suite `live`) — also needs `xdotool`; checks that the
+  remote cursor is scaled together with the desktop.
+
+Live tests run one at a time: they share one server account, and
+concurrent logins evict each other.
 
 All tests need a display; run them with `xvfb-run -a meson test`.
 
@@ -110,6 +115,5 @@ All tests need a display; run them with `xvfb-run -a meson test`.
   the tree but not built; it needs porting to `GdkClipboard` and the
   session thread.
 - Keyboard layout detection reads GNOME settings (Linux).
-- The cursor is not scaled with the remote-desktop scale factor.
 - macOS and Windows builds are written for (key codes, event handles) but
   not yet tested.

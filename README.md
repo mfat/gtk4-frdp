@@ -145,7 +145,6 @@ xvfb-run -a meson test -C _build --suite live
 - No clipboard yet: gtk-frdp's GTK 3 clipboard channel
   (`src/frdp-channel-clipboard.c`) still needs porting to GTK 4.
 - Keyboard layout detection reads GNOME settings.
-- The remote cursor is not scaled when the desktop is scaled.
 - macOS and Windows: code paths exist, builds are untested.
 
 ## License
