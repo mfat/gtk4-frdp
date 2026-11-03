@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* frdp-channel-clipboard.c
  *
  * Copyright (C) 2023 Marek Kasik <mkasik@redhat.com>

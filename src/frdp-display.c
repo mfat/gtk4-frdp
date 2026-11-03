@@ -1,6 +1,8 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* frdp-display.c
  *
  * Copyright (C) 2018 Felipe Borges <felipeborges@gnome.org>
+ * Copyright (C) 2026 mFat
  *
  * GTK4 port for the sshPilot embedded-RDP spike (2026):
  *  - GtkDrawingArea + GTK3 event vfuncs -> GtkWidget + event controllers

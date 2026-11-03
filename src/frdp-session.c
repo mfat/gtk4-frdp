@@ -1,8 +1,10 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* frdp-session.c
  *
  * Copyright (C) 2018 Felipe Borges <felipeborges@gnome.org>
  * Copyright (C) 2019 Armin Novak <akallabeth@posteo.net>
  * Copyright (C) 2023 Marek Kasik <mkasik@redhat.com>
+ * Copyright (C) 2026 mFat
  *
  * GTK4 port with a session thread (2026). Threading model, following
  * Remmina's RDP plugin and FreeRDP's own SDL client:

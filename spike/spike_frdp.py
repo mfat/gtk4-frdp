@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 mFat
 """gtk-frdp GTK4 port spike: same checks as the RDW spike.
 
 Usage: spike_frdp.py HOST PORT USER PASSWORD_FILE [--cycles N] [--hold S] [--idle-cpu S]

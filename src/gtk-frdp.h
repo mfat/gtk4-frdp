@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* gtk-frdp.h
  *
  * Copyright (C) 2018 Felipe Borges <felipeborges@gnome.org>

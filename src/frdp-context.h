@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* frdp-context.h
  *
  * Copyright (C) 2019 Armin Novak <akallabeth@posteo.net>

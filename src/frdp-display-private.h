@@ -1,4 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* frdp-display-private.h
+ *
+ * Copyright (C) 2026 mFat
  *
  * Prompt plumbing between FrdpSession (whose FreeRDP callbacks run on the
  * session thread) and FrdpDisplay (main thread). These replace upstream's
