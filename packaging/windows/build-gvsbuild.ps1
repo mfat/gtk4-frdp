@@ -41,14 +41,15 @@ $Vcpkg = $env:VCPKG_INSTALLATION_ROOT
 & "$Vcpkg\vcpkg.exe" install openssl:x64-windows
 $Ssl = "$Vcpkg\installed\x64-windows"
 
-# 3. FreeRDP: libraries and channels only.
+# 3. FreeRDP: libraries and channels only. zlib comes from gvsbuild (its
+#    zlib1.dll ships with GTK), so the zip does not carry a second copy.
 $FreeRdp = "$Work\freerdp"
 $tarball = "$Work\freerdp-$FreeRdpVersion.tar.gz"
 Get-Checked "https://pub.freerdp.com/releases/freerdp-$FreeRdpVersion.tar.gz" $tarball $FreeRdpSha256
 if (-not (Test-Path "$Work\freerdp-$FreeRdpVersion")) { tar -xzf $tarball -C $Work }
 cmake -S "$Work\freerdp-$FreeRdpVersion" -B "$Work\freerdp-build" -G Ninja `
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$FreeRdp" `
-    -DCMAKE_PREFIX_PATH="$Ssl" -DOPENSSL_ROOT_DIR="$Ssl" `
+    -DCMAKE_PREFIX_PATH="$Ssl;$Gtk" -DOPENSSL_ROOT_DIR="$Ssl" -DZLIB_ROOT="$Gtk" `
     -DWITH_CLIENT=ON -DWITH_CLIENT_COMMON=ON -DWITH_CLIENT_SDL=OFF -DWITH_CLIENT_WINDOWS=OFF `
     -DWITH_SERVER=OFF -DWITH_SAMPLE=OFF -DWITH_MANPAGES=OFF -DWITH_PLATFORM_SERVER=OFF `
     -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_DSP_FFMPEG=OFF -DWITH_OPENH264=OFF `
