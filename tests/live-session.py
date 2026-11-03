@@ -34,16 +34,27 @@ STALL = {"last": time.monotonic(), "max": 0.0}
 
 
 def rss_mb():
-    with open("/proc/self/status") as fh:
-        for line in fh:
-            if line.startswith("VmRSS"):
-                return int(line.split()[1]) // 1024
+    """Current resident memory in MB; -1 where /proc is unavailable (Windows, macOS)."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
     return -1
+
+
+def thread_count():
+    try:
+        return len(os.listdir("/proc/self/task"))
+    except OSError:
+        return -1
 
 
 def log(msg):
     print(f"[{time.monotonic() - T0:7.2f}s rss={rss_mb()}MB "
-          f"thr={len(os.listdir('/proc/self/task'))} "
+          f"thr={thread_count()} "
           f"maxstall={STALL['max'] * 1000:.0f}ms] {msg}", flush=True)
 
 
