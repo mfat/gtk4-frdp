@@ -1,0 +1,24 @@
+# Maintainer: Mehdi <mah.fat@gmail.com>
+pkgname=gtk4-frdp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="GTK 4 widget for embedding FreeRDP 3 remote desktops"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mfat/gtk4-frdp"
+license=('GPL-3.0-or-later' 'LGPL-3.0-or-later' 'Apache-2.0')
+depends=('gtk4' 'freerdp' 'glib2')
+makedepends=('meson' 'gobject-introspection')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')   # replace with the release tarball's checksum (updpkgsums)
+
+build() {
+  # Tests need a display and (for the live suite) an RDP server.
+  arch-meson "$pkgname-$pkgver" build -Dtests=false -Dexamples=false -Ddocumentation=false
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+    "$pkgname-$pkgver"/COPYING "$pkgname-$pkgver"/NOTICE "$pkgname-$pkgver"/LICENSES/*
+}

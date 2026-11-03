@@ -72,3 +72,66 @@ jobs:
         with:
           name: testlog-windows
           path: _build/meson-logs/testlog.txt
+
+  macos:
+    # Homebrew GTK 4 and FreeRDP 3, as the sshPilot macOS bundle uses.
+    runs-on: macos-latest
+    steps:
+      - name: Install dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+        run: brew install meson ninja pkgconf gtk4 freerdp gobject-introspection pygobject3
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          meson setup _build -Dexamples=true
+          meson compile -C _build
+
+      - name: Test
+        run: meson test -C _build --print-errorlogs
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog-macos
+          path: _build/meson-logs/testlog.txt
+
+  windows-gvsbuild:
+    # Visual Studio build against gvsbuild's GTK, for apps that ship gvsbuild
+    # GTK with python.org Python (sshPilot's Windows installer). Produces the
+    # zip packaging/windows/build-gvsbuild.ps1 describes; tagged releases
+    # attach it.
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build tools
+        run: python -m pip install meson ninja
+
+      - name: Build
+        shell: pwsh
+        run: packaging/windows/build-gvsbuild.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gtk4-frdp-gvsbuild-x64
+          path: gtk4-frdp-*-gvsbuild-*-x64.zip*
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" (Get-ChildItem gtk4-frdp-*-gvsbuild-*-x64.zip*).FullName --clobber

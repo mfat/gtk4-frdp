@@ -1,0 +1,60 @@
+Source: gtk4-frdp
+Section: libs
+Priority: optional
+Maintainer: Mehdi <mah.fat@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-sequence-gir,
+               meson (>= 0.62),
+               ninja-build,
+               pkgconf,
+               libglib2.0-dev,
+               libgtk-4-dev (>= 4.14),
+               freerdp3-dev (>= 3.11),
+               libwinpr3-dev (>= 3.11),
+               gobject-introspection,
+               libgirepository1.0-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/mfat/gtk4-frdp
+Vcs-Browser: https://github.com/mfat/gtk4-frdp
+Vcs-Git: https://github.com/mfat/gtk4-frdp.git
+Rules-Requires-Root: no
+
+Package: libgtk4-frdp-4.0-0
+Architecture: any
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: GTK 4 widget for embedding FreeRDP 3 remote desktops
+ gtk4-frdp provides FrdpDisplay, a GTK 4 widget that shows a remote desktop
+ over RDP using FreeRDP 3: keyboard and mouse input, dynamic resolution,
+ clipboard, audio and certificate/login prompts. Each connection runs on its
+ own thread, so connecting never blocks the user interface.
+ .
+ This package contains the shared library.
+
+Package: gir1.2-gtkfrdp-4.0
+Section: introspection
+Architecture: any
+Multi-Arch: same
+Depends: ${gir:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Description: GTK 4 widget for embedding FreeRDP 3 remote desktops - introspection data
+ gtk4-frdp provides FrdpDisplay, a GTK 4 widget that shows a remote desktop
+ over RDP using FreeRDP 3.
+ .
+ This package contains the GObject Introspection data (GtkFrdp-4.0) used by
+ Python, JavaScript and other languages.
+
+Package: libgtk4-frdp-dev
+Section: libdevel
+Architecture: any
+Multi-Arch: same
+Depends: libgtk4-frdp-4.0-0 (= ${binary:Version}),
+         gir1.2-gtkfrdp-4.0 (= ${binary:Version}),
+         libgtk-4-dev,
+         ${gir:Depends},
+         ${misc:Depends}
+Provides: ${gir:Provides}
+Description: GTK 4 widget for embedding FreeRDP 3 remote desktops - development files
+ gtk4-frdp provides FrdpDisplay, a GTK 4 widget that shows a remote desktop
+ over RDP using FreeRDP 3.
+ .
+ This package contains the header files, pkg-config file and GIR XML.

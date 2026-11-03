@@ -1,0 +1,6 @@
+gtk4-frdp (0.1.0-0ubuntu1) resolute; urgency=medium
+
+  * Initial release: GTK 4 port of gtk-frdp with a session thread, clipboard,
+    keyboard layout detection, cursor scaling and auto-logon.
+
+ -- Mehdi <mah.fat@gmail.com>  Tue, 03 Nov 2026 22:30:00 +0330
