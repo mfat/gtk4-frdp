@@ -140,5 +140,7 @@ All tests need a display; run them with `xvfb-run -a meson test`.
 
 - Clipboard file transfer is not supported; HTML has not been tested
   against Windows applications.
-- Windows (MSYS2) builds and passes the automated tests in CI, but has
-  not been tested against a live server. macOS is untested.
+- Windows (MSYS2): automated tests pass in CI and in a desktop session;
+  live-session passes against a Windows 11 host. The clipboard and cursor
+  live tests use xdotool and have not been run on Windows. macOS is
+  untested.

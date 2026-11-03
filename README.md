@@ -20,11 +20,9 @@ gtk4-frdp is derived from GNOME's GTK 3 library
 [gtk-frdp](https://gitlab.gnome.org/GNOME/gtk-frdp). See [NOTICE](NOTICE)
 for what changed.
 
-> Status: 0.1 — works on Linux (tested against Windows 10 Pro and Windows 11
-> hosts).
-> Windows (MSYS2) builds and passes the non-server tests in CI; a live
-> session on Windows has not been tested yet. macOS is untested. The API may still
-> change before 1.0.
+> Status: 0.1 — works on Linux and Windows (MSYS2), tested against Windows 10
+> Pro and Windows 11 hosts. macOS is untested. The API may still change
+> before 1.0.
 
 ## Quick start
 
@@ -156,8 +154,8 @@ xvfb-run -a meson test -C _build --suite live
 - Clipboard: text and images work in both directions; HTML is implemented
   but not yet tested against Windows applications; copying files is not
   supported.
-- Windows: builds and passes the automated tests (MSYS2, CI); not yet
-  tested against a live server. macOS: untested.
+- On Windows, the clipboard and cursor live tests have not been run (they
+  use xdotool). macOS: untested.
 
 ## License
 

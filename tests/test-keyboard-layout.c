@@ -70,6 +70,7 @@ test_detect_windows (void)
 }
 #endif
 
+#ifndef G_OS_WIN32
 static void
 test_detect_environment (void)
 {
@@ -141,6 +142,8 @@ test_detect_fallback (void)
   g_assert_true (g_str_equal (source, "locale") || g_str_equal (source, "default"));
   g_assert_cmphex (id, !=, 0);
 }
+
+#endif /* !G_OS_WIN32 */
 
 int
 main (int argc, char *argv[])
