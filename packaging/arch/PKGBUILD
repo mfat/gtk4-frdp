@@ -1,6 +1,6 @@
 # Maintainer: Mehdi <mah.fat@gmail.com>
 pkgname=gtk4-frdp
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="GTK 4 widget for embedding FreeRDP 3 remote desktops"
 arch=('x86_64' 'aarch64')

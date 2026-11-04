@@ -1,3 +1,10 @@
+gtk4-frdp (0.2.0-0ubuntu1) resolute; urgency=medium
+
+  * New upstream release: private_libdir option for applications that bundle
+    gtk4-frdp; the display can move between windows while connected.
+
+ -- Mehdi <mah.fat@gmail.com>  Wed, 04 Nov 2026 12:00:00 +0330
+
 gtk4-frdp (0.1.0-0ubuntu1) resolute; urgency=medium
 
   * Initial release: GTK 4 port of gtk-frdp with a session thread, clipboard,

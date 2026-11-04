@@ -1,5 +1,5 @@
 Name:           gtk4-frdp
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        GTK 4 widget for embedding FreeRDP 3 remote desktops
 
@@ -54,5 +54,8 @@ Header files, pkg-config file and GIR XML for developing with %{name}.
 %{_datadir}/gir-1.0/GtkFrdp-4.0.gir
 
 %changelog
+* Wed Nov 04 2026 Mehdi <mah.fat@gmail.com> - 0.2.0-1
+- New upstream release: private_libdir option, display can move between windows
+
 * Tue Nov 03 2026 Mehdi <mah.fat@gmail.com> - 0.1.0-1
 - Initial package
