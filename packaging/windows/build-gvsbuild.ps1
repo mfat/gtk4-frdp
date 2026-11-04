@@ -48,6 +48,9 @@ $FreeRdp = "$Work\freerdp"
 $tarball = "$Work\freerdp-$FreeRdpVersion.tar.gz"
 Get-Checked "https://pub.freerdp.com/releases/freerdp-$FreeRdpVersion.tar.gz" $tarball $FreeRdpSha256
 if (-not (Test-Path "$Work\freerdp-$FreeRdpVersion")) { tar -xzf $tarball -C $Work }
+# The tarball sits inside this git checkout, and FreeRDP takes its version
+# from the nearest git tag unless told not to: on a gtk4-frdp tag it builds
+# itself as "0.1.0" (winpr0.pc, freerdp0.pc) and meson cannot find freerdp3.
 cmake -S "$Work\freerdp-$FreeRdpVersion" -B "$Work\freerdp-build" -G Ninja `
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$FreeRdp" `
     -DCMAKE_PREFIX_PATH="$Ssl;$Gtk" -DOPENSSL_ROOT_DIR="$Ssl" -DZLIB_ROOT="$Gtk" `
@@ -56,7 +59,8 @@ cmake -S "$Work\freerdp-$FreeRdpVersion" -B "$Work\freerdp-build" -G Ninja `
     -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_DSP_FFMPEG=OFF -DWITH_OPENH264=OFF `
     -DWITH_KRB5=OFF -DWITH_AAD=OFF -DWITH_WEBVIEW=OFF -DWITH_JSON_DISABLED=ON `
     -DWITH_URIPARSER=OFF -DWITH_CAIRO=OFF -DCHANNEL_URBDRC=OFF -DWITH_WINPR_TOOLS=OFF `
-    -DBUILD_TESTING=OFF -DWITH_MEDIA_FOUNDATION=OFF
+    -DBUILD_TESTING=OFF -DWITH_MEDIA_FOUNDATION=OFF `
+    -DUSE_VERSION_FROM_GIT_TAG=OFF
 cmake --build "$Work\freerdp-build"
 cmake --install "$Work\freerdp-build"
 
