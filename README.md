@@ -123,12 +123,31 @@ Options (`meson configure _build`):
 | `documentation` | false | API reference (needs gi-docgen) |
 | `examples` | false | build the C example viewer |
 | `tests` | true | register the test suite |
+| `private_libdir` | (empty) | install for one application only (below) |
 
 ### Using it as a Meson subproject
 
 ```meson
 gtk4_frdp_dep = dependency('gtk4-frdp-4.0',
   fallback: ['gtk4-frdp', 'gtk4_frdp_dep'])
+```
+
+### Bundling it inside an application package
+
+`-Dprivate_libdir=myapp` puts the library in `<libdir>/myapp` and the typelib
+in `<libdir>/myapp/girepository-1.0`, and installs no headers, pkg-config
+file or GIR XML, so an application package can carry its own copy without
+clashing with a system gtk4-frdp. The application adds both directories
+before loading the namespace. In Python:
+
+```python
+import gi
+repo = gi._gi.Repository.get_default()        # PyGObject >= 3.52
+repo.prepend_search_path(f"{private}/girepository-1.0")
+repo.prepend_library_path(private)
+# Older PyGObject: the same two calls are static methods of
+# GIRepository.Repository (gi.require_version("GIRepository", "2.0")).
+gi.require_version("GtkFrdp", "4.0")
 ```
 
 ### Running from a build tree

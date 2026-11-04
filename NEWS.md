@@ -1,5 +1,11 @@
 # gtk4-frdp releases
 
+## Unreleased
+
+- `private_libdir` option: install the library and typelib into an
+  application's own directory under libdir, without headers, pkg-config file
+  or GIR XML, for applications that bundle gtk4-frdp in their package.
+
 ## 0.1.0 (2026-11-04)
 
 First release as a standalone GTK 4 library, derived from gtk-frdp
