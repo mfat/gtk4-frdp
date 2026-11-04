@@ -1,6 +1,6 @@
 # gtk4-frdp releases
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-04)
 
 First release as a standalone GTK 4 library, derived from gtk-frdp
 (GNOME, GTK 3) at commit 83854a2.
