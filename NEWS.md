@@ -1,6 +1,6 @@
 # gtk4-frdp releases
 
-## 0.2.2 (unreleased)
+## 0.2.2 (2026-11-06)
 
 - `rdp-auth-failure` now reports only a refused logon (wrong password,
   expired or disabled account, logon not permitted, ...). Connection
