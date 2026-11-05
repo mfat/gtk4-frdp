@@ -21,6 +21,8 @@ main (void)
   display = frdp_display_new ();
   g_assert_true (FRDP_IS_DISPLAY (display));
   g_assert_false (frdp_display_is_open (FRDP_DISPLAY (display)));
+  g_assert_nonnull (g_object_class_find_property (G_OBJECT_GET_CLASS (display),
+                                                  "last-error-code"));
   g_object_ref_sink (display);
   g_object_unref (display);
 

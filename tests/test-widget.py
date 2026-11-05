@@ -21,6 +21,9 @@ from gi.repository import GLib, Gtk, GtkFrdp  # noqa: E402
 SKIP = 77
 MAX_UI_STALL = 0.25        # seconds the main loop may be blocked
 UNROUTABLE = "10.255.255.1"  # TCP connect hangs until timeout (or fails fast in some sandboxes)
+# FreeRDP's FREERDP_ERROR_CONNECT_FAILED and ..._CONNECT_TRANSPORT_FAILED.
+CONNECT_FAILED = 0x00020006
+CONNECT_TRANSPORT_FAILED = 0x0002000D
 
 failures = []
 
@@ -120,9 +123,15 @@ class ClosingServer:
 
 
 def watch(display):
-    state = {"disconnected": 0, "failure": None}
-    display.connect("rdp-auth-failure", lambda d, m: state.update(failure=m))
-    display.connect("rdp-error", lambda d, m: state.update(failure=m))
+    """Record the failure: its sentence, the signal it came on, its code."""
+    state = {"disconnected": 0, "failure": None, "signal": None, "code": None}
+
+    def on_failure(widget, message, signal):
+        state.update(failure=message, signal=signal,
+                     code=widget.props.last_error_code)
+
+    display.connect("rdp-auth-failure", lambda d, m: on_failure(d, m, "rdp-auth-failure"))
+    display.connect("rdp-error", lambda d, m: on_failure(d, m, "rdp-error"))
     display.connect("rdp-disconnected",
                     lambda d: state.update(disconnected=state["disconnected"] + 1))
     return state
@@ -175,6 +184,19 @@ def test_handshake_failure():
 
     check(done, "handshake failure ends in rdp-disconnected")
     check(state["failure"] is not None, f"handshake failure is reported ({state['failure']!r})")
+    # The server dropped the connection during the handshake: that is a
+    # connection failure, not a refused logon.
+    check(state["signal"] == "rdp-error",
+          f"a dropped handshake is a connection failure ({state['signal']})")
+    # FreeRDP retries a failed connect once, and the retry clears the error it
+    # recorded; gtk4-frdp restores the first error (the transport one) when
+    # FreeRDP has the setting that records the retry (3.26+). Older builds
+    # keep the generic CONNECT_FAILED.
+    check(state["code"] in (CONNECT_TRANSPORT_FAILED, CONNECT_FAILED),
+          f"the failure carries FreeRDP's code ({state['code']})")
+    if state["code"] == CONNECT_TRANSPORT_FAILED:
+        check("transport" in state["failure"].lower(),
+              f"the code and the sentence agree ({state['failure']!r})")
     check(state["disconnected"] == 1, f"rdp-disconnected is emitted once ({state['disconnected']})")
     check(not display.is_open(), "widget is not open after the failure")
     refs = [window, display]
@@ -201,6 +223,10 @@ def test_refused_port():
         return
     check(done, "refused connection ends in rdp-disconnected")
     check(state["failure"] is not None, f"refused connection is reported ({state['failure']!r})")
+    check(state["signal"] == "rdp-error",
+          f"a refused connect is a connection failure ({state['signal']})")
+    check(state["code"] == CONNECT_FAILED,
+          f"a refused connect is CONNECT_FAILED ({state['code']})")
     check(state["disconnected"] == 1, f"rdp-disconnected is emitted once ({state['disconnected']})")
     refs = [window, display]
     del window, display
