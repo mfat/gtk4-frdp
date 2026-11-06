@@ -42,6 +42,8 @@ $Vcpkg = $env:VCPKG_INSTALLATION_ROOT
 & "$Vcpkg\vcpkg.exe" install openssl:x64-windows
 $Ssl = "$Vcpkg\installed\x64-windows"
 
+# WinPR's built-in MD4/RC4 avoid a runtime dependency on OpenSSL's legacy
+# provider, which is not included in this portable package.
 # 3. FreeRDP: libraries and channels only. zlib comes from gvsbuild (its
 #    zlib1.dll ships with GTK), so the zip does not carry a second copy.
 $FreeRdp = "$Work\freerdp"
@@ -60,6 +62,7 @@ cmake -S "$Work\freerdp-$FreeRdpVersion" -B "$Work\freerdp-build" -G Ninja `
     -DWITH_KRB5=OFF -DWITH_AAD=OFF -DWITH_WEBVIEW=OFF -DWITH_JSON_DISABLED=ON `
     -DWITH_URIPARSER=OFF -DWITH_CAIRO=OFF -DCHANNEL_URBDRC=OFF -DWITH_WINPR_TOOLS=OFF `
     -DBUILD_TESTING=OFF -DWITH_MEDIA_FOUNDATION=OFF `
+    -DWITH_INTERNAL_MD4=ON -DWITH_INTERNAL_RC4=ON `
     -DUSE_VERSION_FROM_GIT_TAG=OFF
 cmake --build "$Work\freerdp-build"
 cmake --install "$Work\freerdp-build"
@@ -102,6 +105,9 @@ Copy-Item "$FreeRdp\bin\freerdp3.dll", "$FreeRdp\bin\freerdp-client3.dll", "$Fre
 Copy-Item "$Ssl\bin\libssl-3-x64.dll", "$Ssl\bin\libcrypto-3-x64.dll" "$stage\bin"
 Copy-Item "$Prefix\lib\girepository-1.0\GtkFrdp-4.0.typelib" "$stage\lib\girepository-1.0"
 Copy-Item "$Source\COPYING", "$Source\NOTICE" $stage
+# Check the staged DLLs, not build-tree copies, before publishing the zip.
+python "$Source\packaging\windows\check-crypto.py" "$stage\bin" "$Gtk\bin"
+if ($LASTEXITCODE -ne 0) { throw "Staged WinPR MD4/RC4 verification failed" }
 $out = "$PWD\gtk4-frdp-$version-gvsbuild-$GvsbuildVersion-x64.zip"
 Compress-Archive -Force "$stage\*" $out
 Get-FileHash -Algorithm SHA256 $out | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path -Leaf $out)" } | Tee-Object "$out.sha256"
