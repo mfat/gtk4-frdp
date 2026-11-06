@@ -1,6 +1,6 @@
 # gtk4-frdp releases
 
-## Unreleased
+## 0.2.4 (2026-11-06)
 
 - Windows portable builds use WinPR's built-in MD4 and RC4 for NTLM and
   RDP crypto instead of depending on an unshipped OpenSSL legacy provider.
